@@ -15,7 +15,7 @@ CALIB_DIR = OUTPUT_DIR / "calibration"     # calibration coupon GDS + CSV
 
 PAD_SIZE = 80.0
 WIRE_WIDTH = 3.0           # aluminium trace width
-WIRE_SPACE = 3.0           # gap between adjacent comb teeth
+WIRE_SPACE = 15.0           # gap between adjacent comb teeth
 COIL_GAP = 38.0            # gap from the pad edge to the first comb tooth
 VIA_SIZE = 8.0             # via from a 2nd-layer wire up to its top-layer pad
 
@@ -339,9 +339,16 @@ def edge_along_range(e, bounds):
 
 
 def edge_gaps(e, edge_coords):
-    """Centres of the pad-to-pad gaps on edge `e` (a return threads one)."""
+    """Centres of the pad-to-pad gaps on edge `e` that a return can actually thread.
+
+    The return runs BETWEEN two probe pads, so both must clear it by WIRE_SPACE -- the
+    gap has to hold the wire plus that clearance on each side. Narrower gaps are dropped
+    rather than squeezed through: routing one would leave metal closer to a probe pad
+    than the process allows, which is a spacing violation even though nothing shorts."""
     c = edge_coords[e]
-    return [(c[i] + c[i + 1]) / 2.0 for i in range(len(c) - 1)]
+    need = PAD_SIZE + WIRE_WIDTH + 2 * WIRE_SPACE      # centre-to-centre, not edge-to-edge
+    return [(c[i] + c[i + 1]) / 2.0 for i in range(len(c) - 1)
+            if c[i + 1] - c[i] >= need - 1e-6]
 
 
 def edge_inputs(group, bounds, target_of):
@@ -448,6 +455,130 @@ def solve_bands(items, edge_lo, edge_hi, must=None):
 CANOPY_CLEAR = 3.0 * ROUTE_PITCH        # radial gap between the base combs and a canopy
 
 
+CHANNEL_MARGIN = 2.0 * ROUTE_PITCH     # clearance between a channel and the first pad
+
+
+def channel_fold(target_lat, width):
+    """How to lay `target_lat` of lateral wire on a storey `width` wide, entering at the
+    low end and FINISHING at the high end so the return channel is reachable.
+
+    One crossing costs `width`; every extra there-and-back costs 2*width. Those alone
+    quantise the length in steps of 2*width, which a small resistor cannot land between,
+    so the remainder is taken up by a short there-and-back of depth `d`. Returns
+    (round_trips, partial_reach, radial_depth)."""
+    extra = max(0.0, target_lat - width)
+    k = int(extra // (2.0 * width))
+    d = (extra - 2.0 * k * width) / 2.0
+    runs = 1 + 2 * k + (2 if d > 1e-6 else 0)
+    return k, d, runs * ROUTE_PITCH
+
+
+def plan_edge_channels(items, edge_lo, edge_hi, gaps):
+    """Route every comb on this edge as a FULL-WIDTH storey.
+
+    The storey scheme reserves a slot at each input's own pad on every storey below it,
+    so a band ends up pinched between neighbouring pads. With pads a few hundred um
+    apart and an 18 um pitch that forces very deep folds and leaves most of the area
+    outboard of the ring empty -- measured fill was under 20 percent.
+
+    Here the slots move OFF the pads into two channels at the ENDS of the edge: risers
+    at the low end, returns at the high end. Each input runs out to its own lead lane
+    under the storeys, along to its riser column, up to its storey, folds across the
+    WHOLE edge, then drops down a return gap past the last pad. Every storey gets
+    essentially the full edge width instead of one pad pitch.
+
+    Nothing can cross, by construction:
+      - lead lanes are ordered by pad position, so a lead never passes over a lane whose
+        span reaches back past its own pad;
+      - riser columns are ordered the same way, so a riser only meets lanes whose span
+        starts to its right;
+      - storey order is REVERSED against pad position, so a comb only passes over risers
+        that stop below it;
+      - returns drop beyond the last pad, clear of every lane and every comb.
+
+    Returns a per-input plan, or None if the channels do not fit -- the caller then
+    falls back to the storey scheme."""
+    n = len(items)
+    a = [it[0] for it in items]
+    pitch = ROUTE_PITCH
+    r0 = PAD_SIZE / 2.0 + COIL_GAP
+    need_ch = n * pitch + CHANNEL_MARGIN
+    if a[0] - edge_lo < need_ch or edge_hi - a[-1] < need_ch:
+        return None
+    # returns drop through real pad gaps past the last pad, one each, pitch apart
+    tail = [g for g in gaps if a[-1] + CHANNEL_MARGIN < g < edge_hi]
+    rets, last = [], -math.inf
+    for g in tail:
+        if g - last >= pitch:
+            rets.append(g)
+            last = g
+        if len(rets) == n:
+            break
+    if len(rets) < n:
+        return None
+    ret_lo = rets[0] - pitch                       # combs stop short of the return bank
+    cols = [edge_lo + CHANNEL_MARGIN / 2.0 + i * pitch for i in range(n)]
+    lanes = [r0 + i * pitch for i in range(n)]
+    if cols[-1] + pitch >= a[0] or ret_lo <= cols[-1] + pitch:
+        return None
+    # storey order reversed against pad order: rightmost pad sits innermost
+    base = r0 + n * pitch + CANOPY_CLEAR
+    fold = [channel_fold(items[j][1], ret_lo - cols[j]) for j in range(n)]
+    rs, r = {}, base
+    for j in reversed(range(n)):
+        rs[j] = r
+        r += fold[j][2] + CANOPY_CLEAR
+    # Return columns go in STOREY order, innermost nearest the combs. A comb runs from
+    # its far end across to its own column, so it passes over the columns nearer than
+    # its own -- those must belong to lower storeys, whose descents stop beneath it.
+    return [{"kind": "channel", "lane": lanes[j], "col": cols[j],
+             "ret": rets[n - 1 - j], "r": rs[j], "hi": ret_lo} for j in range(n)]
+
+
+def build_channel_coil(pad, e, ch, target_len, bounds, plane):
+    """Fold one resistor across a full-width storey, reached by the end channels.
+    Length is trimmed with a partial last run so the target is met exactly."""
+    u, v = inward_along(e)
+    cu = (-u[0], -u[1])
+    a_pad = pad["x"] * v[0] + pad["y"] * v[1]
+    r0 = PAD_SIZE / 2.0 + COIL_GAP
+    lane, col, ret, rs, hi = ch["lane"], ch["col"], ch["ret"], ch["r"], ch["hi"]
+    width = hi - col
+    P = lambda tt, rr: to_xy(e, tt, rr, bounds)
+
+    def build(lat):
+        k, d, _ = channel_fold(lat, width)
+        pts = [(pad["x"], pad["y"]), P(a_pad, lane),      # out to its own lead lane
+               P(col, lane), P(col, rs)]                  # along to its riser, then up
+        r = rs
+        pts.append(P(hi, r))                              # first crossing
+        for _ in range(k):                                # there and back, full width
+            r += ROUTE_PITCH
+            pts += [P(hi, r), P(col, r)]
+            r += ROUTE_PITCH
+            pts += [P(col, r), P(hi, r)]
+        if d > 1e-6:                                      # short there and back, trims
+            r += ROUTE_PITCH
+            pts += [P(hi, r), P(hi - d, r)]
+            r += ROUTE_PITCH
+            pts += [P(hi - d, r), P(hi, r)]
+        pts += [P(ret, r), P(ret, r0)]                    # over to the return gap, down
+        rr = return_through_gap(0.0, 0.0, P(ret, r0), cu, plane)
+        return pts, rr
+
+    # The lead, riser and return add a fixed overhead that is a large fraction of a
+    # SMALL resistor, so solve for the lateral length rather than assuming it.
+    lat, coil, rtn = target_len, None, None
+    for _ in range(24):                                   # length is linear in `lat`
+        coil, rtn = build(lat)
+        err = target_len - (polyline_len(coil) + polyline_len(rtn))
+        if abs(err) < 0.5:
+            break
+        lat = max(0.0, lat + err)
+    r_ohm, clen = _coil_result(pad, coil, rtn, plane)
+    return coil, rtn, r_ohm, clen
+
+
 def plan_edge(items, edge_lo, edge_hi, gaps):
     """Plan every input on one edge: a distinct return gap each, then a stack of storeys.
 
@@ -470,6 +601,9 @@ def plan_edge(items, edge_lo, edge_hi, gaps):
     Costs every split -- the `m` biggest each get a storey, the rest share the base --
     and keeps the shallowest. Returns [(band, gap, rc)] aligned with `items`; rc is None
     for a base-storey input, else the radius its fold starts at."""
+    ch = plan_edge_channels(items, edge_lo, edge_hi, gaps)
+    if ch is not None:                # full-width storeys whenever the channels fit
+        return ch
     n = len(items)
     a = [it[0] for it in items]
     need = [it[1] * ROUTE_PITCH for it in items]
@@ -722,7 +856,9 @@ def build_canopy_coil(pad, e, band, target_len, gap, rc, bounds, plane):
 
 
 def build_input_coil(pad, e, plan, target_len, bounds, plane):
-    """Build one input's resistor from its `plan` -- (band, gap, rc) from plan_edge."""
+    """Build one input's resistor from its `plan` -- from plan_edge."""
+    if isinstance(plan, dict):
+        return build_channel_coil(pad, e, plan, target_len, bounds, plane)
     band, gap, rc = plan
     if rc is None:
         return build_band_coil(pad, e, band, target_len, gap, bounds, plane)
