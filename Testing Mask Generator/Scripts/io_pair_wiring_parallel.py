@@ -1,5 +1,4 @@
 import csv
-import itertools
 import re
 import sys
 import math
@@ -1194,9 +1193,10 @@ def plan_split(group, bounds):
 
     Every pad lands on the ring perimeter, so the arcs are contiguous runs of the
     perimeter-ordered pads and ANY input scatter can be divided -- the VSS case, where
-    the group is spread right around the die. Inputs are shared out as evenly as
-    possible, sizes differing by at most one, and every arc must keep at least 2 output
-    pads. Cuts sit in gaps between pad landings, clear of corners; a cut through a wall
+    the group is spread right around the die. Readings hold 1 to MAX_BINARY_INPUTS inputs each; smaller is
+    preferred, since the largest reading sets the decode margin, but an uneven split is
+    taken when it keeps the cuts off input-hosting walls. Every arc must keep at least
+    2 output pads. Cuts sit in gaps between pad landings, clear of corners; a cut through a wall
     whose edge hosts inputs fragments that edge's routing, so it is taken only when
     input placement forces it.
 
@@ -1285,9 +1285,22 @@ def plan_split(group, bounds):
             i = (i + 1) % m
         return c
 
-    base, extra = divmod(n, k)                  # arc sizes differ by at most one
-    if base < 1:
-        raise SystemExit(f"coupon {group['num']}: {n} inputs cannot fill {k} readings.")
+    # Every way to deal n inputs into k readings of 1..MAX_BINARY_INPUTS each. k is
+    # the smallest number of readings that can hold n, so the slack is under one
+    # reading and the list stays short.
+    def compositions(total, parts):
+        if parts == 1:
+            if 1 <= total <= MAX_BINARY_INPUTS:
+                yield (total,)
+            return
+        for first in range(1, min(MAX_BINARY_INPUTS, total - parts + 1) + 1):
+            for rest in compositions(total - first, parts - 1):
+                yield (first,) + rest
+
+    size_options = sorted(compositions(n, k), key=lambda z: (max(z), -min(z)))
+    if not size_options:
+        raise SystemExit(f"coupon {group['num']}: {n} inputs cannot fill {k} readings "
+                         f"of at most {MAX_BINARY_INPUTS}.")
 
     best = None
     reason = "no gap between pad landings is wide enough for a cut"
@@ -1299,8 +1312,7 @@ def plan_split(group, bounds):
         break
       cands = make_cands(roomy)
       for rot in range(n):
-          for mask in (itertools.combinations(range(k), extra) if extra else [()]):
-              sizes = [base + (1 if j in mask else 0) for j in range(k)]
+          for sizes in size_options:
               windows, at, ok = [], rot, True
               for j in range(k):
                   a_idx = in_pos[(at + sizes[j] - 1) % n]      # last input of arc j
@@ -1340,7 +1352,10 @@ def plan_split(group, bounds):
                       reason = ("no cut placement leaves every reading at least 2 output "
                                 "pads")
                       continue
+                  # die cost first, then the biggest reading -- which alone sets
+                  # the decode margin -- then output redundancy, then cut clearance
                   score = (-sum(cut_cost(g) for g in chosen),
+                           -max(sizes),
                            min(outs_between(chosen[j - 1], chosen[j]) for j in range(k)),
                            min(cands[g][1] for g in chosen))
                   if best is None or score > best[0]:
