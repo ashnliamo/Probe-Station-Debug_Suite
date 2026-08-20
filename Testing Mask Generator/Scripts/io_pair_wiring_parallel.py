@@ -1,4 +1,5 @@
 import csv
+import itertools
 import re
 import sys
 import math
@@ -15,21 +16,39 @@ CALIB_DIR = OUTPUT_DIR / "calibration"     # calibration coupon GDS + CSV
 
 PAD_SIZE = 80.0
 WIRE_WIDTH = 3.0           # aluminium trace width
+CORNER_RADIUS = 1.0        # fillet radius on every trace corner; 0 draws square corners.
+                           # Applied to concave corners as well as convex, so the metal
+                           # removed outside a bend is given back inside it and the
+                           # resistance is left alone. Clamped per corner to half the
+                           # shortest adjacent edge, so short trim runs stay well formed.
+CORNER_TOLERANCE = 0.005   # chord tolerance of the arc approximation, in um
+GDS_MAX_POINTS = 8190      # vertices per polygon in the written GDS -- the GDSII
+                           # format's own ceiling. The gdstk default of 199 fractures
+                           # long filleted coils, and fracturing an arc-dense outline
+                           # can shatter it into disconnected slivers.
 WIRE_SPACE = 15.0           # gap between adjacent comb teeth
+LEAD_SPACE = 100.0           # gap for the LEAD and RETURN wires -- the run from the pad
+                            # to the start of the coil, and from the end of the coil
+                            # back to the central node. Applies between those wires and
+                            # between them and the edge of the coil. Where a return has
+                            # to squeeze BETWEEN TWO PADS it falls back to WIRE_SPACE,
+                            # which is what the pad pitch actually allows.
 COIL_GAP = 38.0            # gap from the pad edge to the first comb tooth
 VIA_SIZE = 8.0             # via from a 2nd-layer wire up to its top-layer pad
 
 PLANE_RING_MARGIN = 70.0   # keep the shared plane this far inside the ring
+PLANE_RING_WIDTH = 500.0   # wall width of the hollow shared-node ring; must be >=
+                           # FINGER_OVERLAP so every landing still meets wall metal
 FINGER_OVERLAP = 60.0      # how far each output finger / return reaches into the plane
-PLANE_SPLIT_GAP = 60.0     # isolation gap between the two half-planes when splitting
-SPLIT_HALVES = False       # set in main(): halve each coupon into two 4-resistor sets
+PLANE_SPLIT_GAP = 60.0     # isolation gap left at each ring cut, between arcs
 
 # Aluminium-on-Ti resistor: R = SHEET_RES * L / W.
 METAL_THICKNESS_UM = 0.1     # 1000 angstrom
 AL_RESISTIVITY = 3.243e-8    # ohm*m
 SHEET_RES = AL_RESISTIVITY / (METAL_THICKNESS_UM * 1e-6)   # ohm/square (~0.324)
 COIL_BASE_R = 4000.0          # ohms for the smallest coil in a group
-MAX_BINARY_INPUTS = 8        # split groups bigger than this into separate coupons
+MAX_BINARY_INPUTS = 4        # max resistors sharing ONE reading; a bigger group is
+                             # cut into that many independent readings on one die
 
 CALIB_COUNT = 4              # number of calibration resistors (first N ladder steps)
 
@@ -78,30 +97,67 @@ def via_layer(k):
 COL_PAD, COL_SIGNAL, COL_X, COL_Y = ("pad", "signal", "x (um)", "y (um)")
 COL_IO = "i/o"     # grouping column: INPUTn / OUTPUTn, blank = unused
 _IO_RE = re.compile(r"(INPUT|OUTPUT)\s*(\d+)$")
-GLOBAL_OUT = "*"   # a bare 'OUTPUT' pad: common to every group, on every chip
-SPLIT_OUT = "+"    # an 'OUTPUTSPLIT' pad: on every chip, halved across the two layers
+GLOBAL_OUT = "*"   # an 'OUTPUTALL' pad: common to every group, on every chip
 SINGLE = "S"       # INPUTSINGLE / OUTPUTSINGLE: one shorted continuity coupon, own layer
 
 
-def classify_io(io_cell):
-    """'INPUT3' -> ('input', 3); 'OUTPUT7' -> ('output', 7); a bare 'OUTPUT' ->
-    ('output', GLOBAL_OUT) -- a common output wired to every group; 'OUTPUTSPLIT' ->
-    ('output', SPLIT_OUT) -- on every chip, halved across the two layers;
-    'INPUTSINGLE'/'OUTPUTSINGLE' -> (role, SINGLE) -- one shorted continuity coupon on
-    its own layer; else ('', None)."""
+def classify_io(io_cell, where=""):
+    """Parse one I/O cell into (role, groups) -- groups is a frozenset.
+
+    'INPUT3' -> ('input', {3}); 'OUTPUT7' -> ('output', {7}). An OUTPUT may name
+    SEVERAL groups, comma separated -- 'OUTPUT1, OUTPUT2' or the shorthand
+    'OUTPUT1,2' -> ('output', {1, 2}) -- and is then wired into each of those
+    groups' coupons. 'OUTPUTALL' -> ('output', {GLOBAL_OUT}), common to every group.
+    'INPUTSINGLE'/'OUTPUTSINGLE' -> (role, {SINGLE}), the shorted continuity coupon.
+    A blank or unrecognised cell -> ('', frozenset()), an unused pad.
+
+    Inputs take exactly one group: the same pad in two groups would need a different
+    ladder rung in each and its contact resistance would perturb two independent
+    readings, which the decode does not model."""
     s = io_cell.strip().upper()
-    if s == "OUTPUT":
-        return ("output", GLOBAL_OUT)
+    if not s:
+        return ("", frozenset())
     if s == "OUTPUTSPLIT":
-        return ("output", SPLIT_OUT)
+        raise SystemExit(
+            f"OUTPUTSPLIT has been retired{where}. Tag the pad with the groups it "
+            f"serves instead -- 'OUTPUT1, OUTPUT2' for those two groups, or "
+            f"'OUTPUTALL' for every group.")
+    if s == "OUTPUTALL":
+        return ("output", frozenset([GLOBAL_OUT]))
+    if s == "OUTPUT":
+        raise SystemExit(
+            f"A bare 'OUTPUT' tag is no longer accepted{where}. Use 'OUTPUTALL' for an "
+            f"output common to every group, or 'OUTPUTn' to name the group.")
     if s == "INPUTSINGLE":
-        return ("input", SINGLE)
+        return ("input", frozenset([SINGLE]))
     if s == "OUTPUTSINGLE":
-        return ("output", SINGLE)
-    m = _IO_RE.match(s)
-    if not m:
-        return ("", None)
-    return ("input" if m.group(1) == "INPUT" else "output", int(m.group(2)))
+        return ("output", frozenset([SINGLE]))
+
+    parts = [q.strip() for q in s.split(",") if q.strip()]
+    roles, nums, last_role = set(), set(), None
+    for q in parts:
+        m = _IO_RE.match(q)
+        if not m:                                  # bare '2' continues 'OUTPUT1,2'
+            if last_role and q.isdigit():
+                roles.add(last_role)
+                nums.add(int(q))
+                continue
+            return ("", frozenset())
+        last_role = "input" if m.group(1) == "INPUT" else "output"
+        roles.add(last_role)
+        nums.add(int(m.group(2)))
+    if not nums:
+        return ("", frozenset())
+    if len(roles) > 1:
+        raise SystemExit(f"'{io_cell.strip()}' mixes INPUT and OUTPUT tags{where}; "
+                         f"a pad is one or the other.")
+    role = roles.pop()
+    if role == "input" and len(nums) > 1:
+        raise SystemExit(
+            f"'{io_cell.strip()}'{where}: only OUTPUT pads may name several groups. An "
+            f"input in two groups would need a different resistor value in each and "
+            f"would perturb both readings. Give it one INPUTn tag.")
+    return (role, frozenset(nums))
 
 
 # ----------------------------------------------------------------------
@@ -160,9 +216,11 @@ def read_pads(csv_path):
         name = row[ipad].strip() if ipad is not None and ipad < len(row) else ""
         signal = row[isig].strip() if isig is not None and isig < len(row) else ""
         io_cell = row[iio].strip() if iio < len(row) else ""
-        role, group = classify_io(io_cell)
+        role, groups = classify_io(io_cell, f" on pad {name}" if name else "")
         pads.append({"name": name, "signal": signal, "x": x, "y": y,
-                     "io": role, "group": group})
+                     "io": role, "groups": groups,
+                     # single representative, for the SINGLE / OUTPUTALL checks
+                     "group": next(iter(groups)) if len(groups) == 1 else None})
     return pads
 
 def dist(a, b):
@@ -181,49 +239,62 @@ def place_pads(pads, raw_bounds, margins):
 
 def assign_groups(inputs, outputs):
     """Group pads by IO number. A group needs inputs and at least one output -- its own
-    OUTPUTn, a bare 'OUTPUT' (common to every group), or an 'OUTPUTSPLIT' pad (added
-    to every chip's layers at build time). Returns [{"num", "inputs", "outputs"}]
-    sorted by number. OUTPUTSPLIT pads are NOT attached here -- build_chip halves them
-    across each chip's two layers."""
-    common = [p for p in outputs if p["group"] == GLOBAL_OUT]
-    has_split = any(p["group"] == SPLIT_OUT for p in outputs)
+    OUTPUTn, or an OUTPUTALL common to every group. An OUTPUT naming several groups
+    joins EVERY one of them, so the same pad appears in each of those coupons.
+    Returns [{"num", "inputs", "outputs"}] sorted by number."""
+    common = [p for p in outputs if GLOBAL_OUT in p["groups"]]
     in_by, out_by = {}, {}
     for p in inputs:
         in_by.setdefault(p["group"], []).append(p)
     for p in outputs:
-        if p["group"] not in (GLOBAL_OUT, SPLIT_OUT):
-            out_by.setdefault(p["group"], []).append(p)
+        for n in p["groups"]:                      # a pad may name several groups
+            if n != GLOBAL_OUT:
+                out_by.setdefault(n, []).append(p)
     groups = []
     for n in sorted(in_by):
         outs = out_by.get(n, []) + common          # own outputs first, then the common
-        if outs or has_split:                      # split pads guarantee output access
+        if outs:
             groups.append({"num": n, "inputs": in_by[n], "outputs": outs})
     return groups
 
 
-def split_coupons(groups, max_in):
-    """Split groups into "coupons" (one metal layer each) of <= max_in inputs. Each
-    carries the group's outputs and restarts the ladder, so it decodes on its own.
-    Coupons keep the group `num` so sub-coupons stay off the same chip."""
-    coupons = []
-    for g in groups:
-        ins = ordered_inputs(g)
-        chunks = [ins[i:i + max_in] for i in range(0, len(ins), max_in)] or [[]]
-        for j, chunk in enumerate(chunks):
-            coupons.append({"num": g["num"], "sub": j, "inputs": chunk,
-                            "outputs": g["outputs"]})
-    return coupons
+def arcs_needed(n_inputs):
+    """How many independent readings a coupon of `n_inputs` must be cut into so no
+    reading carries more than MAX_BINARY_INPUTS resistors. 1 means do not split."""
+    return max(1, -(-n_inputs // MAX_BINARY_INPUTS))       # ceil
+
+
+def split_coupons(groups):
+    """One coupon per group. A group over MAX_BINARY_INPUTS is NOT spread over extra
+    chips any more -- it is cut into that many independent arcs of the shared ring on a
+    single die, which costs no die area and no wafer yield. See plan_split."""
+    return [{"num": g["num"], "sub": 0, "inputs": ordered_inputs(g),
+             "outputs": g["outputs"]} for g in groups]
+
+
+def coupon_pads(c):
+    """Every pad a coupon owns -- the set that decides whether it can share a chip."""
+    return {id(p) for p in list(c["inputs"]) + list(c["outputs"])}
 
 
 def pack_chips(coupons, per_chip):
-    """Assign coupons to chips (`per_chip` layers each), never two coupons of the
-    same group on one chip (they share output pads, which would tie them)."""
+    """Assign coupons to chips of `per_chip` metal layers each.
+
+    Two coupons may share a chip only if their pad sets are DISJOINT. Pads live on the
+    top metal and a second-layer coupon reaches them through vias, so a pad claimed by
+    both layers would tie the two coupons' planes together and destroy both decodes.
+    An OUTPUTALL pad belongs to every group, so a pinout using it can never pair and
+    falls back to single-layer chips, as it must.
+
+    Greedy maximum pairing: each unpaired coupon takes the first partner it can, so
+    coupons that CAN share a die still do and only the leftovers go on their own."""
     if per_chip <= 1:
         return [[c] for c in coupons]
     rem, chips = list(coupons), []
     while rem:
         a = rem.pop(0)
-        j = next((i for i, b in enumerate(rem) if b["num"] != a["num"]), None)
+        pa = coupon_pads(a)
+        j = next((i for i, b in enumerate(rem) if not (pa & coupon_pads(b))), None)
         chips.append([a, rem.pop(j)] if j is not None else [a])
     return chips
 
@@ -250,6 +321,7 @@ def inward_along(edge):
 
 
 ROUTE_PITCH = WIRE_WIDTH + WIRE_SPACE   # tooth pitch (traces sit WIRE_SPACE apart)
+LEAD_PITCH = WIRE_WIDTH + LEAD_SPACE    # lead/return pitch (they sit LEAD_SPACE apart)
 
 
 def decode_margin(resistances):
@@ -280,10 +352,8 @@ def input_target_len(k):
 
 def ordered_inputs(group):
     """Group inputs ranked by distance to the first output (rank k -> target R). A
-    group whose only outputs are OUTPUTSPLIT pads has no dedicated output here, so it
-    ranks by the input centroid instead -- a stable reference that does not depend on
-    which split pads a chip happens to get, keeping ranks identical across the sizing
-    and drawing passes."""
+    group with no output of its own ranks by the input centroid instead -- a stable
+    reference that keeps ranks identical across the sizing and drawing passes."""
     outs = group["outputs"]
     if outs:
         ref = outs[0]
@@ -353,8 +423,8 @@ def edge_gaps(e, edge_coords):
 
 def edge_inputs(group, bounds, target_of):
     """Same-group inputs bucketed by edge, each sorted by along-coord and tagged
-    (along, target_len, pad). `target_of` maps id(pad) -> target trace length, so a
-    split coupon's two halves can each run their own ladder."""
+    (along, target_len, pad). `target_of` maps id(pad) -> target trace length, so
+    each reading of a split coupon runs its own ladder."""
     by_edge = {}
     for p in group["inputs"]:
         e = edge_of(p, bounds)
@@ -473,15 +543,11 @@ def channel_fold(target_lat, width):
     return k, d, runs * ROUTE_PITCH
 
 
-def plan_edge_channels(items, edge_lo, edge_hi, gaps):
+def _plan_channels_core(items, edge_lo, edge_hi, gaps):
     """Route every comb on this edge as a FULL-WIDTH storey.
 
-    The storey scheme reserves a slot at each input's own pad on every storey below it,
-    so a band ends up pinched between neighbouring pads. With pads a few hundred um
-    apart and an 18 um pitch that forces very deep folds and leaves most of the area
-    outboard of the ring empty -- measured fill was under 20 percent.
-
-    Here the slots move OFF the pads into two channels at the ENDS of the edge: risers
+    The storey scheme in plan_edge pinches each band between neighbouring pads, which
+    forces very deep folds. Here the slots move OFF the pads into two channels at the ENDS of the edge: risers
     at the low end, returns at the high end. Each input runs out to its own lead lane
     under the storeys, along to its riser column, up to its storey, folds across the
     WHOLE edge, then drops down a return gap past the last pad. Every storey gets
@@ -496,16 +562,24 @@ def plan_edge_channels(items, edge_lo, edge_hi, gaps):
         that stop below it;
       - returns drop beyond the last pad, clear of every lane and every comb.
 
+    Two spacings are in play. The lead lanes, the riser columns and the setback of the
+    combs from the return bank are all LEAD_SPACE apart, so the wires running to and
+    from each coil can be held further off each other and off the coil than the teeth
+    are. The return bank itself is WIRE_SPACE, because those drops thread real pad gaps
+    and the pad pitch, not the router, sets what fits there.
+
     Returns a per-input plan, or None if the channels do not fit -- the caller then
     falls back to the storey scheme."""
     n = len(items)
     a = [it[0] for it in items]
-    pitch = ROUTE_PITCH
+    pitch = ROUTE_PITCH                    # comb teeth, and anything between two pads
+    lead = LEAD_PITCH                      # lead lanes, riser columns, coil setback
     r0 = PAD_SIZE / 2.0 + COIL_GAP
-    need_ch = n * pitch + CHANNEL_MARGIN
+    need_ch = n * lead + CHANNEL_MARGIN
     if a[0] - edge_lo < need_ch or edge_hi - a[-1] < need_ch:
         return None
-    # returns drop through real pad gaps past the last pad, one each, pitch apart
+    # Returns drop through real pad gaps past the last pad, one each. This run is boxed
+    # in by the pads either side, so it is WIRE_SPACE that applies here, not LEAD_SPACE.
     tail = [g for g in gaps if a[-1] + CHANNEL_MARGIN < g < edge_hi]
     rets, last = [], -math.inf
     for g in tail:
@@ -516,13 +590,14 @@ def plan_edge_channels(items, edge_lo, edge_hi, gaps):
             break
     if len(rets) < n:
         return None
-    ret_lo = rets[0] - pitch                       # combs stop short of the return bank
-    cols = [edge_lo + CHANNEL_MARGIN / 2.0 + i * pitch for i in range(n)]
-    lanes = [r0 + i * pitch for i in range(n)]
-    if cols[-1] + pitch >= a[0] or ret_lo <= cols[-1] + pitch:
+    ret_lo = rets[0] - lead              # combs stop LEAD_SPACE short of the return bank
+    cols = [edge_lo + CHANNEL_MARGIN / 2.0 + i * lead for i in range(n)]
+    lanes = [r0 + i * lead for i in range(n)]
+    if cols[-1] + lead >= a[0] or ret_lo <= cols[-1] + lead:
         return None
-    # storey order reversed against pad order: rightmost pad sits innermost
-    base = r0 + n * pitch + CANOPY_CLEAR
+    # storey order reversed against pad order: rightmost pad sits innermost. The first
+    # storey clears the outermost lead lane by lead + CANOPY_CLEAR.
+    base = r0 + n * lead + CANOPY_CLEAR
     fold = [channel_fold(items[j][1], ret_lo - cols[j]) for j in range(n)]
     rs, r = {}, base
     for j in reversed(range(n)):
@@ -535,6 +610,43 @@ def plan_edge_channels(items, edge_lo, edge_hi, gaps):
              "ret": rets[n - 1 - j], "r": rs[j], "hi": ret_lo} for j in range(n)]
 
 
+def plan_edge_channels(items, edge_lo, edge_hi, gaps):
+    """Full-width storeys for this edge, trying BOTH directions along it.
+
+    The channel scheme puts the riser bank at one end and the return bank at the other,
+    so it needs clearance at both -- but which end has the clearance is an accident of
+    where the pads and the ring cuts fall. A sub-edge created by a cut often has room at
+    one end only. Mirroring the along-edge coordinate swaps the two banks over, which
+    costs nothing and rescues exactly those cases; without it they drop to the storey
+    fallback, whose combs fold PERPENDICULAR to the edge in a band one pad-pitch wide
+    and can protrude for millimetres.
+
+    Prefers whichever direction folds shallower, so the die is set by the better of the
+    two rather than by whichever happened to be tried first."""
+    best = None
+    for flip in (False, True):
+        if flip:
+            t = lambda q: edge_lo + edge_hi - q
+            mitems = sorted(((t(a), tl, pad) for a, tl, pad in items),
+                            key=lambda it: it[0])
+            mgaps = sorted(t(q) for q in gaps)
+            plan = _plan_channels_core(mitems, edge_lo, edge_hi, mgaps)
+            if plan is None:
+                continue
+            back = {id(it[2]): pl for it, pl in zip(mitems, plan)}
+            plan = [dict(back[id(pad)]) for _, _, pad in items]
+            for pl in plan:                     # along-coords mirror; radii do not
+                pl["col"], pl["ret"], pl["hi"] = t(pl["col"]), t(pl["ret"]), t(pl["hi"])
+        else:
+            plan = _plan_channels_core(items, edge_lo, edge_hi, gaps)
+            if plan is None:
+                continue
+        depth = max(pl["r"] for pl in plan)
+        if best is None or depth < best[0]:
+            best = (depth, plan)
+    return None if best is None else best[1]
+
+
 def build_channel_coil(pad, e, ch, target_len, bounds, plane):
     """Fold one resistor across a full-width storey, reached by the end channels.
     Length is trimmed with a partial last run so the target is met exactly."""
@@ -543,7 +655,11 @@ def build_channel_coil(pad, e, ch, target_len, bounds, plane):
     a_pad = pad["x"] * v[0] + pad["y"] * v[1]
     r0 = PAD_SIZE / 2.0 + COIL_GAP
     lane, col, ret, rs, hi = ch["lane"], ch["col"], ch["ret"], ch["r"], ch["hi"]
-    width = hi - col
+    # The fold may run either way along the edge: risers at the low end and returns at
+    # the high end, or mirrored. Only the SIGN differs, so work in |width| and step the
+    # trimming run back toward the riser whichever way that is.
+    width = abs(hi - col)
+    sdir = 1.0 if hi >= col else -1.0
     P = lambda tt, rr: to_xy(e, tt, rr, bounds)
 
     def build(lat):
@@ -558,12 +674,13 @@ def build_channel_coil(pad, e, ch, target_len, bounds, plane):
             r += ROUTE_PITCH
             pts += [P(col, r), P(hi, r)]
         if d > 1e-6:                                      # short there and back, trims
+            back = hi - sdir * d
             r += ROUTE_PITCH
-            pts += [P(hi, r), P(hi - d, r)]
+            pts += [P(hi, r), P(back, r)]
             r += ROUTE_PITCH
-            pts += [P(hi - d, r), P(hi, r)]
+            pts += [P(back, r), P(hi, r)]
         pts += [P(ret, r), P(ret, r0)]                    # over to the return gap, down
-        rr = return_through_gap(0.0, 0.0, P(ret, r0), cu, plane)
+        rr = return_through_gap(P(ret, r0), cu, plane)
         return pts, rr
 
     # The lead, riser and return add a fixed overhead that is a large fraction of a
@@ -664,7 +781,47 @@ def plan_edge(items, edge_lo, edge_hi, gaps):
     return [(plan[i][0], gap_of[i], plan[i][1]) for i in range(n)]
 
 
-def return_through_gap(px, py, far_end, cu, plane):
+def cuts_on_edge(e, split):
+    """Along-coordinates of the ring cuts that land on edge e's wall, sorted."""
+    env, _, cuts = split
+    return sorted(al for t in cuts
+                  for s, al in (_t_to_edge(env, t),) if s == e)
+
+
+def plan_edge_pieces(e, items, bounds, edge_coords, split):
+    """plan_edge, but honouring the ring cuts. A cut through this edge's wall means
+    the inputs either side belong to different halves, so the edge is partitioned at
+    the cut into independent routing SUB-EDGES, each planned on its own -- its riser
+    channel, storeys and return bank all stay inside its own span, which is exactly
+    the stretch of wall its half owns. Without this, the channel router would bank
+    every return past the LAST pad of the whole edge, marooning the lower half's
+    returns on the upper half's arc. Plans are returned in `items` order."""
+    gaps = edge_gaps(e, edge_coords)
+    elo, ehi = edge_along_range(e, bounds)
+    cuts = [c for c in (cuts_on_edge(e, split) if split else []) if elo < c < ehi]
+    if not cuts:
+        return plan_edge(items, elo, ehi, gaps)
+    marg = PLANE_SPLIT_GAP / 2.0 + WIRE_SPACE
+    stops = [elo] + cuts + [ehi]
+
+    def sub_of(a):
+        return sum(1 for c in cuts if a >= c)
+
+    plans = [None] * len(items)
+    for s in range(len(stops) - 1):
+        idx = [i for i, (a, _, _) in enumerate(items) if sub_of(a) == s]
+        if not idx:
+            continue
+        lo = stops[s] + (marg if s else 0.0)
+        hi = stops[s + 1] - (marg if s + 2 < len(stops) else 0.0)
+        sub = plan_edge([items[i] for i in idx], lo, hi,
+                        [g for g in gaps if lo < g < hi])
+        for i, pl in zip(idx, sub):
+            plans[i] = pl
+    return plans
+
+
+def return_through_gap(far_end, cu, plane):
     """Polyline from the comb's far end straight INWARD onto the plane. The far end
     already sits in a pad gap, so this drops perpendicular through it."""
     px0, py0, px1, py1 = plane
@@ -687,25 +844,35 @@ def return_through_gap(px, py, far_end, cu, plane):
 CORNER_SQUARES = 0.56
 
 
-def _overlap(a0, a1, b0, b1):
-    lo, hi = max(min(a0, a1), min(b0, b1)), min(max(a0, a1), max(b0, b1))
-    return max(0.0, hi - lo)
-
-
 def _seg_outside(p, q, nodes):
-    """Length of axis-aligned segment p->q lying OUTSIDE every node rectangle."""
+    """Length of axis-aligned segment p->q lying OUTSIDE every node rectangle. The
+    covered spans are UNIONed, not maxed: the shared node is a ring of four disjoint
+    walls, so one segment can be covered piecewise by more than one rectangle."""
     length = math.dist(p, q)
     if length < 1e-9:
         return 0.0
     horiz, vert = abs(p[1] - q[1]) < 1e-6, abs(p[0] - q[0]) < 1e-6
     if not (horiz or vert):
         return length                                  # no diagonal traces in practice
-    covered = 0.0
+    a0, a1 = (p[0], q[0]) if horiz else (p[1], q[1])
+    spans = []
     for rx0, ry0, rx1, ry1 in nodes:
         if horiz and ry0 - 1e-6 <= p[1] <= ry1 + 1e-6:
-            covered = max(covered, _overlap(p[0], q[0], rx0, rx1))
+            b0, b1 = rx0, rx1
         elif vert and rx0 - 1e-6 <= p[0] <= rx1 + 1e-6:
-            covered = max(covered, _overlap(p[1], q[1], ry0, ry1))
+            b0, b1 = ry0, ry1
+        else:
+            continue
+        lo = max(min(a0, a1), min(b0, b1))
+        hi = min(max(a0, a1), max(b0, b1))
+        if hi > lo:
+            spans.append((lo, hi))
+    covered, reach = 0.0, -math.inf                    # union of the covered spans
+    for lo, hi in sorted(spans):
+        lo = max(lo, reach)
+        if hi > lo:
+            covered += hi - lo
+            reach = hi
     return max(0.0, length - covered)
 
 
@@ -740,7 +907,8 @@ def resistive_length(pts, nodes):
 def _coil_result(pad, coil, ret, plane):
     """Actual extracted resistance and total length for a finished coil."""
     hp = PAD_SIZE / 2.0
-    nodes = [(pad["x"] - hp, pad["y"] - hp, pad["x"] + hp, pad["y"] + hp), plane]
+    nodes = [(pad["x"] - hp, pad["y"] - hp, pad["x"] + hp, pad["y"] + hp)]
+    nodes += ring_rects(plane)            # only the walls are metal, not the hollow
     r_ohm = SHEET_RES * resistive_length(coil + ret, nodes) / WIRE_WIDTH
     return r_ohm, polyline_len(coil) + polyline_len(ret)
 
@@ -787,7 +955,7 @@ def build_band_coil(pad, e, band, target_len, gap, bounds, plane):
                 if j < m - 1:
                     pts.append(P(t + s * ROUTE_PITCH, r0))
             out = not out
-        ret = return_through_gap(0.0, 0.0, P(gap, r0), cu, plane)
+        ret = return_through_gap(P(gap, r0), cu, plane)
         return pts, ret
 
     depth, coil, ret, clen = target_len / m, None, None, 0.0
@@ -843,7 +1011,7 @@ def build_canopy_coil(pad, e, band, target_len, gap, rc, bounds, plane):
             out = not out
         t_end = a_pad + s * (m - 1) * ROUTE_PITCH
         pts += [P(t_end, rtop), P(gap, rtop), P(gap, r0)]  # over the top, down the gap
-        ret = return_through_gap(0.0, 0.0, P(gap, r0), cu, plane)
+        ret = return_through_gap(P(gap, r0), cu, plane)
         return pts, ret
 
     depth, coil, ret = max(ROUTE_PITCH, target_len / m), None, None
@@ -872,6 +1040,26 @@ def rect(x0, y0, x1, y1, layer):
     return gdstk.rectangle((x0, y0), (x1, y1), layer=layer, datatype=METAL_DT)
 
 
+def trace_polys(pts, layer):
+    """One trace as polygons, with every corner rounded to CORNER_RADIUS.
+
+    A square corner is the first thing the lithography rounds off anyway, and a sharp
+    inside corner is where resist is slowest to clear and where current crowds. Doing it
+    in the layout makes the drawn shape the intended one. Rounding both senses of corner
+    keeps it resistance-neutral: the wedge taken off the outside of a bend is the same
+    size as the one added on the inside."""
+    clean = [pts[0]]                     # the band builders emit duplicate consecutive
+    for p in pts[1:]:                    # vertices; drop them so no degenerate joins
+        if abs(p[0] - clean[-1][0]) > 1e-9 or abs(p[1] - clean[-1][1]) > 1e-9:
+            clean.append(p)
+    path = gdstk.FlexPath(clean, WIRE_WIDTH, layer=layer, datatype=METAL_DT)
+    polys = path.to_polygons()
+    if CORNER_RADIUS > 0.0:
+        for p in polys:
+            p.fillet(CORNER_RADIUS, tolerance=CORNER_TOLERANCE)
+    return polys
+
+
 def pad_poly(p, layer):
     h = PAD_SIZE / 2.0
     return rect(p["x"] - h, p["y"] - h, p["x"] + h, p["y"] + h, layer)
@@ -888,97 +1076,309 @@ def via_polys(pt, k):
 
 
 def central_plane(bounds):
-    """The shared-node PLANE filling the ring interior, inset PLANE_RING_MARGIN to
-    clear the pads. Returns (px0, py0, px1, py1)."""
+    """OUTER envelope of the shared node, inset PLANE_RING_MARGIN inside the pad ring.
+    The node itself is drawn hollow -- see ring_rects -- but every finger and return
+    still lands on this rectangle's boundary, so all the landing geometry keys off it.
+    Returns (px0, py0, px1, py1)."""
     minx, maxx, miny, maxy = bounds
     return (minx + PLANE_RING_MARGIN, miny + PLANE_RING_MARGIN,
             maxx - PLANE_RING_MARGIN, maxy - PLANE_RING_MARGIN)
 
 
-MIN_SPLIT_INPUTS = 4       # below this a coupon is already easy to read; don't split
+def ring_rects(plane):
+    """The shared node as a hollow rectangular RING: the four PLANE_RING_WIDTH walls of
+    envelope `plane`, middle left empty. The walls are disjoint, so they tile the ring
+    exactly once.
+
+    Nothing is lost by hollowing it: every finger and return lands on the envelope
+    boundary and reaches only FINGER_OVERLAP inward, so it always meets wall metal and
+    the extracted resistances are unchanged. A plane too small to hollow stays solid."""
+    px0, py0, px1, py1 = plane
+    w = PLANE_RING_WIDTH
+    if px1 - px0 <= 2.0 * w or py1 - py0 <= 2.0 * w:
+        return [(px0, py0, px1, py1)]                    # too small to hollow
+    return [(px0, py0, px1, py0 + w),                    # bottom wall, full width
+            (px0, py1 - w, px1, py1),                    # top wall, full width
+            (px0, py0 + w, px0 + w, py1 - w),            # left wall, between the two
+            (px1 - w, py0 + w, px1, py1 - w)]            # right wall, between the two
 
 
-def plan_split(group, bounds, all_pads):
-    """Divide a coupon in two, each half getting its own plane, its own share of the
-    OUTPUT pads and its own restarted ladder. Halving the inputs is what buys decode
-    margin: 4 resistors need only 1 part in 15 resolved instead of 1 part in 255, and
-    the top resistor drops from 128k to 8k.
+# A coupon is cut into ceil(inputs / MAX_BINARY_INPUTS) independent readings, so
+# MAX_BINARY_INPUTS is the ceiling on resistors sharing one measurement -- the term
+# that dominates the decode margin, which is 1/(2**n - 1) for n resistors.
 
-    The cut has to be SPATIAL, because each input returns straight inward and must land
-    on its own half's plane. Pads whose return or finger lands on a plane SIDE pin the
-    divider down, so it is placed in the clear band between the two halves -- never
-    through a pad, which would leave a return stranded in the isolation gap.
 
-    Tries a horizontal and a vertical cut and keeps the better balanced. Returns
-    (axis, divider) or None if no clean cut exists. Output candidates include the
-    OUTPUTSPLIT pads, so the divider is the same in the sizing and drawing passes even
-    though a 2-layer chip only hands half of them to each layer."""
+# ----------------------------------------------------------------------
+# Ring-cut split: the shared node is a hollow ring, so cutting it open at
+# k points along its perimeter yields k connected arcs, one per reading.
+# Every pad's landing is a point on that perimeter, so any contiguous run
+# of pads can form a reading, however the inputs scatter around the die.
+# ----------------------------------------------------------------------
+def _perim_frame(env):
+    """(width, height, perimeter) of the plane envelope."""
+    px0, py0, px1, py1 = env
+    return px1 - px0, py1 - py0, 2.0 * ((px1 - px0) + (py1 - py0))
+
+
+def perim_t(env, bounds, p):
+    """Perimeter coordinate of pad p's landing on the envelope, walking
+    counter-clockwise from the bottom-left corner: bottom, right, top, left."""
+    px0, py0, px1, py1 = env
+    wd, hd, _ = _perim_frame(env)
+    e = edge_of(p, bounds)
+    if e == "bottom":
+        return min(max(p["x"] - px0, 0.0), wd)
+    if e == "right":
+        return wd + min(max(p["y"] - py0, 0.0), hd)
+    if e == "top":
+        return wd + hd + min(max(px1 - p["x"], 0.0), wd)
+    return 2.0 * wd + hd + min(max(py1 - p["y"], 0.0), hd)          # left
+
+
+def _in_arc(t, ta, tb, per):
+    """True if perimeter coord t lies on the counter-clockwise arc ta -> tb."""
+    return (t - ta) % per < (tb - ta) % per
+
+
+def _t_to_edge(env, t):
+    """(edge name, along-coordinate) of perimeter coord t."""
+    px0, py0, px1, py1 = env
+    wd, hd, per = _perim_frame(env)
+    t %= per
+    if t < wd:
+        return "bottom", px0 + t
+    if t < wd + hd:
+        return "right", py0 + (t - wd)
+    if t < 2.0 * wd + hd:
+        return "top", px1 - (t - wd - hd)
+    return "left", py1 - (t - 2.0 * wd - hd)
+
+
+def arc_rects(env, ta, tb, inset=0.0):
+    """Wall rectangles of the ring arc from ta counter-clockwise to tb, each end
+    pulled back by `inset` so two arcs leave PLANE_SPLIT_GAP between them. Pieces
+    overlap by a wall-width square at each corner they pass through, which is
+    harmless: same net, and the extraction unions covered spans."""
+    px0, py0, px1, py1 = env
+    wd, hd, per = _perim_frame(env)
+    w = PLANE_RING_WIDTH
+    sides = (0.0, wd, wd + hd, 2.0 * wd + hd, per)
+    t = (ta + inset) % per
+    remaining = (tb - ta) % per - 2.0 * inset
+    rects = []
+    while remaining > 1e-9:
+        k = next(i for i in range(4) if sides[i] - 1e-9 <= t < sides[i + 1] - 1e-9)
+        seg = min(remaining, sides[k + 1] - t)
+        t0, t1 = t - sides[k], t - sides[k] + seg              # side-local span
+        if seg > 1e-9:
+            if k == 0:                                          # bottom wall
+                rects.append((px0 + t0, py0, px0 + t1, py0 + w))
+            elif k == 1:                                        # right wall
+                rects.append((px1 - w, py0 + t0, px1, py0 + t1))
+            elif k == 2:                                        # top wall
+                rects.append((px1 - t1, py1 - w, px1 - t0, py1))
+            else:                                               # left wall
+                rects.append((px0, py1 - t1, px0 + w, py1 - t0))
+        t = (t + seg) % per
+        remaining -= seg
+    return rects
+
+
+def plan_split(group, bounds):
+    """Choose the ring cuts that divide this coupon into independent readings.
+
+    The coupon needs `arcs_needed(len(inputs))` readings so none carries more than
+    MAX_BINARY_INPUTS resistors -- k cuts through the ring wall give exactly k
+    connected arcs. Returns None when k == 1, else (env, bounds, [t0..tk-1]) with the
+    cuts in perimeter order; arc j runs counter-clockwise from cut j to cut j+1.
+
+    Every pad lands on the ring perimeter, so the arcs are contiguous runs of the
+    perimeter-ordered pads and ANY input scatter can be divided -- the VSS case, where
+    the group is spread right around the die. Inputs are shared out as evenly as
+    possible, sizes differing by at most one, and every arc must keep at least 2 output
+    pads. Cuts sit in gaps between pad landings, clear of corners; a cut through a wall
+    whose edge hosts inputs fragments that edge's routing, so it is taken only when
+    input placement forces it.
+
+    The choice is remembered on the group by the identity of the pad before each cut,
+    because the sizing pass and the drawing pass see different absolute coordinates --
+    the ring is rescaled between them -- and both must divide the coupon identically or
+    the resistor ladders diverge."""
     # A continuity coupon is already one shorted node; halving it would leave each
     # input reachable from only half the returns, which its CSV does not express. The
     # calibration coupon is a star onto ONE common pad, and splitting it would restart
     # the ladder per half and give duplicate values instead of one rung each.
-    if (group.get("single") or group.get("calib")
-            or len(group["inputs"]) < MIN_SPLIT_INPUTS):
+    if group.get("single") or group.get("calib"):
         return None
-    ins = group["inputs"]
-    outs = list(group["outputs"]) + [p for p in all_pads if p["io"] == "output"
-                                     and p["group"] == SPLIT_OUT]
-    if not outs:
+    ins = list(group["inputs"])
+    k = arcs_needed(len(ins))
+    if k < 2:
         return None
-    minx, maxx, miny, maxy = bounds
+    env = central_plane(bounds)
+    wd, hd, per = _perim_frame(env)
+    if len(ring_rects(env)) == 1:
+        return None                                    # solid plane: nothing to cut
+    outs = list(group["outputs"])
+    if len(outs) < 2 * k:
+        raise SystemExit(
+            f"coupon {group['num']}: {len(ins)} inputs need {k} independent readings "
+            f"of at most {MAX_BINARY_INPUTS} resistors, so {2 * k} output pads are "
+            f"required -- 2 per reading -- but only {len(outs)} are tagged for this "
+            f"group. Add OUTPUTn or OUTPUTALL pads, or raise MAX_BINARY_INPUTS.")
+
+    lands = sorted([(perim_t(env, bounds, p), p["io"] == "input", p)
+                    for p in ins + outs])
+    m = len(lands)
+    in_pos = [i for i in range(m) if lands[i][1]]      # indices of inputs, in order
+    n = len(in_pos)
+    g2 = PLANE_SPLIT_GAP / 2.0
+    corner_zone = PLANE_RING_WIDTH + WIRE_SPACE + g2
+    corners = [0.0, wd, wd + hd, 2.0 * wd + hd, per]
+
+    # Room the channel router needs beside a cut: its riser bank is one column per
+    # input on that edge, and without that room the sub-edge falls back to combs folded
+    # in a band one pad-pitch wide, which can protrude for millimetres.
+    per_edge = {}
+    for q in ins:
+        per_edge[edge_of(q, bounds)] = per_edge.get(edge_of(q, bounds), 0) + 1
+    riser_room = max(per_edge.values(), default=0) * LEAD_PITCH + CHANNEL_MARGIN
+
+    def make_cands(roomy):
+        def clearance(is_input):
+            # beside an input pad the cut also bounds a routing sub-edge, which needs
+            # room for that side's riser channel or return bank next to the cut
+            if not is_input:
+                return PAD_SIZE / 2.0 + WIRE_SPACE + g2
+            extra = riser_room if roomy else CHANNEL_MARGIN
+            return PAD_SIZE / 2.0 + WIRE_SPACE + g2 + extra
+
+        out = {}
+        for i in range(m):
+            t0, in0, _ = lands[i]
+            t1, in1, _ = lands[(i + 1) % m]
+            if (i + 1) == m:
+                t1 += per
+            lo, hi = t0 + clearance(in0), t1 - clearance(in1)
+            pieces = [(lo, hi)]
+            for c in corners + [c + per for c in corners]:
+                pieces = [q for a, b in pieces
+                          for q in ((a, min(b, c - corner_zone)),
+                                    (max(a, c + corner_zone), b)) if q[1] > q[0]]
+            if pieces:
+                a, b = max(pieces, key=lambda q: q[1] - q[0])
+                out[i] = (((a + b) / 2.0) % per, b - a)
+        return out
+
+    in_sides = {edge_of(p, bounds) for p in ins}
+
+    def cut_cost(gi):
+        return 1 if _t_to_edge(env, cands[gi][0])[0] in in_sides else 0
+
+    def outs_between(gi, gj):
+        """Output pads on the arc that starts just after gap gi and ends at gap gj."""
+        c, i = 0, (gi + 1) % m
+        stop = (gj + 1) % m
+        while i != stop:
+            if not lands[i][1]:
+                c += 1
+            i = (i + 1) % m
+        return c
+
+    base, extra = divmod(n, k)                  # arc sizes differ by at most one
+    if base < 1:
+        raise SystemExit(f"coupon {group['num']}: {n} inputs cannot fill {k} readings.")
+
+    cached = group.get("_split_cache")
+    if cached:
+        for roomy in (True, False):
+            cands = make_cands(roomy)
+            by_id = {id(lands[i][2]): i for i in range(m)}
+            gis = [by_id.get(pid) for pid in cached]
+            if all(g is not None and g in cands for g in gis):
+                return (env, bounds, sorted(cands[g][0] for g in gis))
+        raise SystemExit(f"internal: coupon {group['num']}'s split no longer fits "
+                         f"after rescaling; this is a bug, please report it.")
+
     best = None
-    for axis in ("y", "x"):
-        key = (lambda p: p["y"]) if axis == "y" else (lambda p: p["x"])
-        lo, hi = (miny, maxy) if axis == "y" else (minx, maxx)
-        mid = (lo + hi) / 2.0
-        li = [p for p in ins if key(p) < mid]
-        hi_i = [p for p in ins if key(p) >= mid]
-        if not (li and hi_i):
-            continue
-        # only pads whose return or finger lands on a plane SIDE pin the divider
-        side = ("left", "right") if axis == "y" else ("bottom", "top")
-        on_side = [p for p in ins + outs if edge_of(p, bounds) in side]
-        cl = [key(p) for p in on_side if key(p) < mid]
-        ch = [key(p) for p in on_side if key(p) >= mid]
-        d_lo = (max(cl) + PAD_SIZE) if cl else lo
-        d_hi = (min(ch) - PAD_SIZE) if ch else hi
-        if d_hi - d_lo < PLANE_SPLIT_GAP + 2 * FINGER_OVERLAP:
-            continue                                  # no clear band for the divider
-        div = (d_lo + d_hi) / 2.0
-        if not (any(key(p) < div for p in outs) and any(key(p) >= div for p in outs)):
-            continue                                  # a half would have no output
-        cand = (abs(len(li) - len(hi_i)), -min(len(li), len(hi_i)), axis, div)
-        if best is None or cand[:2] < best[:2]:
-            best = cand
-    return None if best is None else (best[2], best[3])
+    reason = "no gap between pad landings is wide enough for a cut"
+    # Two passes: first demanding enough room beside every cut for the channel router's
+    # riser bank, then, only if that admits no split at all, with the bare minimum.
+    for roomy in (True, False):
+      cands = make_cands(roomy)
+      if best is not None:
+        break
+      for rot in range(n):
+          for mask in (itertools.combinations(range(k), extra) if extra else [()]):
+              sizes = [base + (1 if j in mask else 0) for j in range(k)]
+              windows, at, ok = [], rot, True
+              for j in range(k):
+                  a_idx = in_pos[(at + sizes[j] - 1) % n]      # last input of arc j
+                  b_idx = in_pos[(at + sizes[j]) % n]          # first input of arc j+1
+                  w, i = [], a_idx
+                  while True:
+                      if i in cands:
+                          w.append(i)
+                      if i == (b_idx - 1) % m:
+                          break
+                      i = (i + 1) % m
+                  if not w:
+                      ok = False
+                      break
+                  windows.append(w)
+                  at = (at + sizes[j]) % n
+              if not ok:
+                  reason = ("no gap is available between the inputs where a cut would "
+                            "have to fall")
+                  continue
+              # one gap per window; arc j's output count depends on windows j-1 and j
+              for first in windows[0]:
+                  chosen, prev, good = [first], first, True
+                  for j in range(1, k):
+                      pick = next((c for c in windows[j]
+                                   if c != prev and outs_between(prev, c) >= 2), None)
+                      if pick is None:
+                          good = False
+                          break
+                      chosen.append(pick)
+                      prev = pick
+                  if not good or len(set(chosen)) < k:
+                      reason = ("no cut placement leaves every reading at least 2 output "
+                                "pads")
+                      continue
+                  if outs_between(chosen[-1], chosen[0]) < 2:
+                      reason = ("no cut placement leaves every reading at least 2 output "
+                                "pads")
+                      continue
+                  score = (-sum(cut_cost(g) for g in chosen),
+                           min(outs_between(chosen[j - 1], chosen[j]) for j in range(k)),
+                           min(cands[g][1] for g in chosen))
+                  if best is None or score > best[0]:
+                      best = (score, chosen)
+    if best is None:
+        raise SystemExit(
+            f"coupon {group['num']} cannot be cut into {k} independent readings: "
+            f"{reason}. Spread its OUTPUT pads further around the ring, add more of "
+            f"them, or raise MAX_BINARY_INPUTS.")
+    chosen = best[1]
+    group["_split_cache"] = tuple(id(lands[g][2]) for g in chosen)
+    return (env, bounds, sorted(cands[g][0] for g in chosen))
 
 
-def split_planes(bounds, axis, divider):
-    """The two isolated half-planes either side of `divider`."""
-    px0, py0, px1, py1 = central_plane(bounds)
-    g = PLANE_SPLIT_GAP / 2.0
-    if axis == "y":
-        return (px0, py0, px1, divider - g), (px0, divider + g, px1, py1)
-    return (px0, py0, divider - g, py1), (divider + g, py0, px1, py1)
-
-
-def coupon_planes(group, bounds, all_pads):
-    """Plane geometry for one coupon. Returns (planes, split); split is None when the
-    coupon is drawn whole, else (axis, divider, plane_low, plane_high)."""
-    whole = central_plane(bounds)
-    sp = plan_split(group, bounds, all_pads) if SPLIT_HALVES else None
-    if sp is None:
-        return [whole], None
-    axis, divider = sp
-    pl, ph = split_planes(bounds, axis, divider)
-    return [pl, ph], (axis, divider, pl, ph)
+def split_arcs(split):
+    """[(t_start, t_end)] for each arc, in cut order."""
+    _, _, cuts = split
+    return [(cuts[j], cuts[(j + 1) % len(cuts)]) for j in range(len(cuts))]
 
 
 def half_of(p, split):
-    """Which half a pad belongs to: (half_id, its plane)."""
-    axis, divider, pl, ph = split
-    v = p["y"] if axis == "y" else p["x"]
-    return (1, pl) if v < divider else (2, ph)
+    """Which arc a pad belongs to: (arc_id starting at 1, the shared envelope)."""
+    env, bnds, _ = split
+    _, _, per = _perim_frame(env)
+    t = perim_t(env, bnds, p)
+    for j, (ta, tb) in enumerate(split_arcs(split)):
+        if _in_arc(t, ta, tb, per):
+            return (j + 1, env)
+    return (1, env)                          # exactly on a cut: first arc owns it
 
 
 def input_targets(group, input_sets=None):
@@ -1005,14 +1405,11 @@ def _plane_label(cell, txt, plane, layer_idx):
     cell.add(*gdstk.text(txt, size, (cx, cy), layer=LABEL_LAYER, datatype=LABEL_DT))
 
 
-def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads, extra_outputs=(),
-               single=False):
-    """One group on metal `layer_idx`: a central PLANE is the shared node; each INPUT
-    grows a resistor comb outside the ring, folded to fill its own along-edge band,
-    returning inward through a pad gap to the plane. Each OUTPUT joins the plane with
-    a pad-width finger. `extra_outputs` are this layer's OUTPUTSPLIT taps -- drawn as
-    extra output fingers but kept OUT of input ranking (which uses the group's own
-    outputs, or its input centroid), so ranks match the sizing pass. `single` draws a
+def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads, single=False):
+    """One group on metal `layer_idx`: a central hollow RING is the shared node; each
+    INPUT grows a resistor comb outside the pad ring, folded to fill its own along-edge
+    band, returning inward through a pad gap onto the ring wall. Each OUTPUT joins it with
+    a pad-width finger. `single` draws a
     continuity coupon instead: no combs -- every INPUTSINGLE and OUTPUTSINGLE pad is
     shorted straight to the plane, so each independent input is a per-pin continuity
     check against the shared return. 2nd-layer groups get a via at each pad. Returns
@@ -1020,7 +1417,7 @@ def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads, extra_outputs
     L = metal_layer(layer_idx)
     needs_via = layer_idx > 0
     hp = PAD_SIZE / 2.0
-    all_outs = list(group["outputs"]) + list(extra_outputs)
+    all_outs = list(group["outputs"])
     polys = []
 
     def add(obj):
@@ -1031,18 +1428,36 @@ def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads, extra_outputs
         for vp in via_polys(pt, 0):                 # stitch metal L down to top
             add(vp)
 
-    # One plane, or two isolated half-planes when the coupon is split in two.
-    planes, split = coupon_planes(group, bounds, all_pads)
-    if split is not None:                 # both halves must end up usable on this layer
-        lo_i = [p for p in group["inputs"] if half_of(p, split)[0] == 1]
-        hi_i = [p for p in group["inputs"] if half_of(p, split)[0] == 2]
-        lo_o = [p for p in all_outs if half_of(p, split)[0] == 1]
-        hi_o = [p for p in all_outs if half_of(p, split)[0] == 2]
-        if not all((lo_i, hi_i, lo_o, hi_o)):
-            planes, split = [central_plane(bounds)], None
-    for pp in planes:
-        add(rect(pp[0], pp[1], pp[2], pp[3], L))
-    plane = planes[0]
+    # One hollow ring, or k isolated ring ARCS when the coupon is cut into readings.
+    plane = central_plane(bounds)
+    split = plan_split(group, bounds)
+    arc_ins, arc_outs = [], []
+    if split is not None:
+        env, _, cuts = split
+        k = len(cuts)
+        arc_ins = [[p for p in group["inputs"] if half_of(p, split)[0] == j + 1]
+                   for j in range(k)]
+        arc_outs = [[p for p in all_outs if half_of(p, split)[0] == j + 1]
+                    for j in range(k)]
+        thin = [j + 1 for j in range(k) if len(arc_outs[j]) < 2]
+        if thin:                       # THIS layer's real share, checked for real
+            raise SystemExit(
+                f"chip {chip_idx} layer {layer_idx + 1}, coupon {group['num']}: "
+                f"reading(s) {thin} end up with fewer than 2 output pads "
+                f"({[len(o) for o in arc_outs]}). Tag more OUTPUT pads for this group, "
+                f"or spread them further around the ring.")
+        for t0, t1 in split_arcs(split):
+            for wx0, wy0, wx1, wy1 in arc_rects(env, t0, t1,
+                                                inset=PLANE_SPLIT_GAP / 2.0):
+                add(rect(wx0, wy0, wx1, wy1, L))
+        where = "; ".join(f"{s} {al:.0f}" for s, al in
+                          (_t_to_edge(env, t) for t in cuts))
+        print(f"    coupon {group['num']}: {len(group['inputs'])} inputs -> {k} "
+              f"readings of {[len(a) for a in arc_ins]} with "
+              f"{[len(o) for o in arc_outs]} outputs; ring cut at {where}.")
+    else:
+        for wx0, wy0, wx1, wy1 in ring_rects(plane):
+            add(rect(wx0, wy0, wx1, wy1, L))
     plane_of = ({id(p): half_of(p, split)[1]
                  for p in list(group["inputs"]) + list(all_outs)} if split
                 else {id(p): plane for p in list(group["inputs"]) + list(all_outs)})
@@ -1064,7 +1479,6 @@ def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads, extra_outputs
             via_at((cx, cy))
 
     if single:                                       # continuity coupon: short all pads
-        # Returns are OUTPUTSINGLE pads plus any OUTPUTSPLIT half on this layer.
         if ADD_LABELS:
             ins = ", ".join(p["name"] for p in group["inputs"])
             rets = ", ".join(p["name"] for p in all_outs)
@@ -1076,24 +1490,24 @@ def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads, extra_outputs
                  "continuity"] for inp in group["inputs"]]
         return polys, rows
 
-    # Each half is its own decode unit, so it gets its own label and its own outputs.
-    units = ([(1, lo_i, lo_o, split[2]), (2, hi_i, hi_o, split[3])] if split
-             else [(0, group["inputs"], all_outs, plane)])
+    # Each arc is its own decode unit, so it gets its own label and its own outputs.
+    units = ([(j + 1, arc_ins[j], arc_outs[j], plane) for j in range(len(arc_ins))]
+             if split else [(0, group["inputs"], all_outs, plane)])
     if ADD_LABELS:
         for hid, ins, outs, pp in units:
-            tag = f"Half {hid} - " if hid else ""
+            tag = f"Reading {hid} - " if hid else ""
             names = ", ".join(p["name"] for p in
                               ordered_inputs({"inputs": ins, "outputs": outs}))
             _plane_label(cell, f"{tag}Inputs: {names}, Outputs: "
-                               f"{', '.join(o['name'] for o in outs)}", pp, layer_idx)
+                               f"{', '.join(o['name'] for o in outs)}", pp,
+                         layer_idx * 2 + hid - 1 if hid else layer_idx)
 
-    # Bands are solved per EDGE across the whole coupon, so the two halves' combs stay
-    # disjoint even where both have inputs on the same edge.
+    # Bands are solved per EDGE PIECE: the whole edge normally, or the sub-edges
+    # between ring cuts, so each half's routing stays on its own arc of the ring.
     target_of = input_targets(group, [u[1] for u in units] if split else None)
     plan_of = {}
     for e, items in edge_inputs(group, bounds, target_of).items():
-        elo, ehi = edge_along_range(e, bounds)
-        plans = plan_edge(items, elo, ehi, edge_gaps(e, edge_coords))
+        plans = plan_edge_pieces(e, items, bounds, edge_coords, split)
         for (_, _, pad), pl in zip(items, plans):
             plan_of[id(pad)] = (e, pl)
 
@@ -1104,8 +1518,8 @@ def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads, extra_outputs
             e, pl = plan_of[id(inp)]
             coil, ret, r, clen = build_input_coil(inp, e, pl, target_of[id(inp)],
                                                   bounds, pp)
-            add(gdstk.FlexPath(coil, WIRE_WIDTH, layer=L, datatype=METAL_DT))
-            add(gdstk.FlexPath(ret, WIRE_WIDTH, layer=L, datatype=METAL_DT))
+            for tp in trace_polys(coil, L) + trace_polys(ret, L):
+                add(tp)
             if needs_via:
                 via_at((inp["x"], inp["y"]))
             r_vals.append(r)
@@ -1221,7 +1635,7 @@ def mosaic_place(entries, gap, cols):
     (each cell spans [x, x+w] x [y-h, y], matching the die outline convention),
     field_w is the widest row, field_h the total stack height."""
     origins, x, y, row_h, max_w = [], 0.0, 0.0, 0.0, 0.0
-    for i, (c, w, h) in enumerate(entries):
+    for i, (_, w, h) in enumerate(entries):
         if i % cols == 0 and i:
             max_w = max(max_w, x - gap)               # drop the trailing gap
             x, y, row_h = 0.0, y - row_h - gap, 0.0
@@ -1289,7 +1703,7 @@ def build_mosaic(entries, gap, cols):
     lib = gdstk.Library(unit=1e-6, precision=1e-9)
     lib.add(*[c for c, _, _ in entries])
     top = lib.new_cell("MOSAIC")
-    for (c, w, h), origin in zip(entries, origins):
+    for (c, _w, _h), origin in zip(entries, origins):
         top.add(gdstk.Reference(c, origin=origin))
     return lib, fw, fh
 
@@ -1420,51 +1834,26 @@ def find_input_csv():
 
 
 def parse_args(argv):
-    """(csv_path, layers, split). `--layers 1|2` and `--split`/`--no-split` skip their
-    prompts; either is None when not given. With no path, uses the single file in
-    inputs/."""
-    layers, split, pos = None, None, []
+    """(csv_path, layers). `--layers 1|2` skips its prompt and is None when not given.
+    With no path, uses the single file in inputs/. Splitting is no longer a mode: a
+    coupon is cut into as many readings as MAX_BINARY_INPUTS demands, automatically.
+    `--split`/`--no-split` are accepted and ignored, so old commands still run."""
+    layers, pos = None, []
     i = 1
     while i < len(argv):
         if argv[i] in ("--layers", "-l") and i + 1 < len(argv):
             layers = argv[i + 1]
             i += 2
-        elif argv[i] == "--split":
-            split, i = True, i + 1
-        elif argv[i] == "--no-split":
-            split, i = False, i + 1
+        elif argv[i] in ("--split", "--no-split"):
+            print(f"  ! {argv[i]} is obsolete and ignored: coupons are now cut into "
+                  f"readings of at most MAX_BINARY_INPUTS={MAX_BINARY_INPUTS} "
+                  f"automatically.")
+            i += 1
         else:
             pos.append(argv[i])
             i += 1
     csv_path = pathlib.Path(pos[0]) if pos else find_input_csv()
-    return csv_path, (int(layers) if layers in ("1", "2") else None), split
-
-
-def ask_split(default=False):
-    """Ask whether to halve each coupon into two independent 4-resistor sets."""
-    if not sys.stdin.isatty():
-        return default
-    prompt = ("\nSplit each coupon into two independent halves?\n"
-              "  n = no  - one set of resistors per layer, one reading\n"
-              "  y = yes - two halves per layer, each with its own plane and half the\n"
-              "            output pads, so each half is read on its own. Halving the\n"
-              "            resistor count per reading widens the decode margin a lot\n"
-              "            and shrinks the biggest resistor.\n"
-              "            Needs the two halves' output pads NOT shorted to each other\n"
-              "            externally, or the halves rejoin off-chip.\n"
-              f"Enter y or n [{'y' if default else 'n'}]: ")
-    while True:
-        try:
-            ans = input(prompt).strip().lower()
-        except EOFError:
-            return default
-        if ans == "":
-            return default
-        if ans in ("y", "yes"):
-            return True
-        if ans in ("n", "no"):
-            return False
-        print("  Please enter y or n.")
+    return csv_path, (int(layers) if layers in ("1", "2") else None)
 
 
 def ask_layers(default=2):
@@ -1492,7 +1881,7 @@ def size_and_place(pads, groups, min_die=(0.0, 0.0)):
     """Build each coil at its raw position to measure per-edge protrusion, set the
     global die size (>= farthest comb + DIE_MARGIN_BUFFER, ring aspect kept, and
     >= `min_die` in each dimension so the chips match the calibration coupon), and
-    centre the ring. Returns (edge_depth, ring_w, ring_h, scale)."""
+    centre the ring. Returns the per-edge protrusion."""
     rxs = [p["x"] for p in pads]
     rys = [p["y"] for p in pads]
     raw_bounds = (min(rxs), max(rxs), min(rys), max(rys))
@@ -1503,13 +1892,12 @@ def size_and_place(pads, groups, min_die=(0.0, 0.0)):
     for g in groups:
         if g.get("single"):                 # continuity coupon has fingers, no combs
             continue
-        planes, split = coupon_planes(g, raw_bounds, pads)
-        sets = ([[p for p in g["inputs"] if half_of(p, split)[0] == h] for h in (1, 2)]
-                if split else None)
+        split = plan_split(g, raw_bounds)
+        sets = ([[p for p in g["inputs"] if half_of(p, split)[0] == j + 1]
+                 for j in range(len(split[2]))] if split else None)
         target_of = input_targets(g, sets)
         for e, items in edge_inputs(g, raw_bounds, target_of).items():
-            elo, ehi = edge_along_range(e, raw_bounds)
-            plans = plan_edge(items, elo, ehi, edge_gaps(e, raw_edges))
+            plans = plan_edge_pieces(e, items, raw_bounds, raw_edges, split)
             for (_, tl, pad), pl in zip(items, plans):
                 coil, _, _, _ = build_input_coil(
                     pad, e, pl, tl, raw_bounds,
@@ -1525,7 +1913,7 @@ def size_and_place(pads, groups, min_die=(0.0, 0.0)):
     content_h = ring_h + edge_depth["top"] + edge_depth["bottom"] + 2 * buf
     scale = max(content_w / ring_w, content_h / ring_h)
     global DIE_W, DIE_H
-    DIE_W, DIE_H = scale * ring_w, scale * ring_h
+    DIE_W, DIE_H = scale * ring_w, scale * ring_h        # scale keeps the ring aspect
     DIE_W, DIE_H = max(DIE_W, min_die[0]), max(DIE_H, min_die[1])  # match calibration
     margins = {                                 # centre the content in the die
         "left": edge_depth["left"] + buf + (DIE_W - content_w) / 2,
@@ -1534,42 +1922,22 @@ def size_and_place(pads, groups, min_die=(0.0, 0.0)):
         "bottom": edge_depth["bottom"] + buf + (DIE_H - content_h) / 2,
     }
     place_pads(pads, raw_bounds, margins)
-    return edge_depth, ring_w, ring_h, scale
+    return edge_depth
 
 
-def split_for_chip(split_outs, n_layers):
-    """Halve the OUTPUTSPLIT pads across the chip's layers, alternating so each half
-    is spread out (list them in perimeter order to spread by position). A half serves
-    as extra output taps for a parallel layer, or as the shorted return for a single
-    continuity layer. A one-layer chip takes them all. Returns {layer_idx: [pads]}."""
-    split_outs = list(split_outs)
-    if not split_outs:
-        return {}
-    if n_layers <= 1:
-        return {0: split_outs}
-    return {0: split_outs[0::2], 1: split_outs[1::2]}
-
-
-def build_chip(ci, chip_groups, pads, bounds, split_outs=()):
+def build_chip(ci, chip_groups, pads, bounds):
     """One chip's GDS: every pad on the top layer (wired ones tagged to their group),
-    each group's combs on its own metal layer, then the die outline LAST. OUTPUTSPLIT
-    pads are halved across the parallel layers -- each half wired to that layer's plane
-    as extra output taps. A single/continuity coupon shorts its INPUTSINGLE and
-    OUTPUTSINGLE pads to its plane. Returns (library, geo, csv_rows); geo maps
-    net-id -> polygons."""
+    each group's combs on its own metal layer, then the die outline LAST. A
+    continuity coupon shorts its INPUTSINGLE and OUTPUTSINGLE pads to its ring instead.
+    Returns (library, geo, csv_rows); geo maps net-id -> polygons."""
     top = metal_layer(0)
     lib = gdstk.Library(unit=1e-6, precision=1e-9)
     cell = lib.new_cell(f"CHIP{ci}")
     geo = {}
-    split_by_layer = split_for_chip(split_outs, len(chip_groups))
     pad_net = {}
     for group in chip_groups:
         for p in group["inputs"] + group["outputs"]:
             pad_net[id(p)] = ("group", group["num"])
-    for li, extra in split_by_layer.items():       # split pads join their layer's net
-        if li < len(chip_groups):
-            for p in extra:
-                pad_net[id(p)] = ("group", chip_groups[li]["num"])
     for p in pads:
         key = pad_net.get(id(p), ("pads",))
         poly = pad_poly(p, top)
@@ -1590,7 +1958,6 @@ def build_chip(ci, chip_groups, pads, bounds, split_outs=()):
     rows = []
     for li, group in enumerate(chip_groups):
         wpolys, grows = draw_group(group, li, bounds, cell, ci, pads,
-                                   split_by_layer.get(li, []),
                                    single=group.get("single", False))
         geo.setdefault(("group", group["num"]), []).extend(wpolys)
         rows.extend(grows)
@@ -1601,41 +1968,41 @@ def build_chip(ci, chip_groups, pads, bounds, split_outs=()):
 
 
 def main():
-    csv_path, layers, split = parse_args(sys.argv)
+    csv_path, layers = parse_args(sys.argv)
     if layers is None:
         layers = ask_layers()
-    if split is None:
-        split = ask_split()
-    global SPLIT_HALVES
-    SPLIT_HALVES = split
     groups_per_chip = layers
     pads = read_pads(csv_path)
-    single_in = [p for p in pads if p["io"] == "input" and p["group"] == SINGLE]
-    single_out = [p for p in pads if p["io"] == "output" and p["group"] == SINGLE]
-    has_split = any(p["group"] == SPLIT_OUT for p in pads)
+    single_in = [p for p in pads if p["io"] == "input" and SINGLE in p["groups"]]
+    single_out = [p for p in pads if p["io"] == "output" and SINGLE in p["groups"]]
+    common_pads = [p for p in pads if p["io"] == "output" and GLOBAL_OUT in p["groups"]]
     if single_out and not single_in:                 # OUTPUTSINGLE only pairs with INPUTSINGLE
         raise SystemExit("OUTPUTSINGLE pads only pair with INPUTSINGLE: add INPUTSINGLE "
                          "pads, or remove the OUTPUTSINGLE ones.")
-    if single_in and not (single_out or has_split):  # INPUTSINGLE needs a shared return
-        raise SystemExit("INPUTSINGLE pads need a shared return: add OUTPUTSINGLE or "
-                         "OUTPUTSPLIT pads for the continuity coupon.")
-    inputs = [p for p in pads if p["io"] == "input" and p["group"] != SINGLE]
-    outputs = [p for p in pads if p["io"] == "output" and p["group"] != SINGLE]
+    if single_in and not (single_out or common_pads
+                          or any(p["io"] == "output" and SINGLE not in p["groups"]
+                                 for p in pads)):
+        raise SystemExit("INPUTSINGLE pads need a shared return, and the pinout has no "
+                         "output pads at all. Add OUTPUTSINGLE, OUTPUTALL or OUTPUTn "
+                         "pads for the continuity coupon.")
+    inputs = [p for p in pads if p["io"] == "input" and SINGLE not in p["groups"]]
+    outputs = [p for p in pads if p["io"] == "output" and SINGLE not in p["groups"]]
     if not (inputs or single_in) or not (outputs or single_out):
         raise SystemExit("Need at least one input and one output.")
     groups = assign_groups(inputs, outputs)
-    split_outs = [p for p in outputs if p["group"] == SPLIT_OUT]
-    if any(p["group"] == GLOBAL_OUT for p in outputs) and groups_per_chip > 1:
-        print("  ! A common OUTPUT pad is shared by every group; using 1 group per "
-              "chip so two groups can't tie their shared output together.")
-        groups_per_chip = 1
-    if split_outs and groups_per_chip < 2:
-        print("  ! OUTPUTSPLIT needs 2 layers to halve across; with 1 layer per chip "
-              "all OUTPUTSPLIT pads go on the single layer.")
-    coupons = split_coupons(groups, MAX_BINARY_INPUTS)   # big groups -> sub-coupons
+    coupons = split_coupons(groups)                      # one coupon per group
     if single_in:                                    # one shorted continuity coupon
+        # Its return is, in order of preference: OUTPUTSINGLE pads, else the OUTPUTALL
+        # pads, else every group output. The coupon is a single shorted node on its own
+        # layer, so any output pad can serve -- and pack_chips will keep it off a chip
+        # whose other layer claims the same pads, which is what stops them tying.
+        single_ret = single_out or common_pads or list(outputs)
+        if not single_out:
+            src = "OUTPUTALL" if common_pads else "group OUTPUT"
+            print(f"  ! No OUTPUTSINGLE pads: the continuity coupon returns through "
+                  f"the {len(single_ret)} {src} pads instead.")
         coupons.append({"num": SINGLE, "sub": 0, "single": True,
-                        "inputs": single_in, "outputs": single_out})
+                        "inputs": single_in, "outputs": single_ret})
 
     # The calibration coupon sits on the same pad ring and folds its combs outside it
     # exactly like a test chip, so it is sized together with them and every die matches.
@@ -1643,19 +2010,43 @@ def main():
     calib = calib_coupon(all_outs, CALIB_COUNT)
     if calib is None:
         print("  ! Fewer than 2 output pads -- no calibration coupon built.")
-    edge_depth, ring_w, ring_h, scale = size_and_place(
-        pads, coupons + ([calib] if calib else []))
+    # Every coupon is cut into readings of at most MAX_BINARY_INPUTS; check the
+    # output budget for all of them BEFORE any geometry is built, so a pinout that
+    # cannot meet the 2-outputs-per-reading floor fails with one clear message.
+    for c in coupons:
+        if c.get("single"):
+            continue
+        k = arcs_needed(len(c["inputs"]))
+        if k > 1 and len(c["outputs"]) < 2 * k:
+            raise SystemExit(
+                f"coupon {c['num']}: {len(c['inputs'])} inputs need {k} readings of at "
+                f"most {MAX_BINARY_INPUTS} resistors, so {2 * k} output pads are "
+                f"required -- 2 per reading -- but only {len(c['outputs'])} are tagged "
+                f"for this group. Add OUTPUTn or OUTPUTALL pads, or raise "
+                f"MAX_BINARY_INPUTS.")
+
+    edge_depth = size_and_place(pads, coupons + ([calib] if calib else []))
 
     print(f"{len(inputs)} inputs, {len(outputs)} outputs; die {DIE_W:.0f} x {DIE_H:.0f} um ")
     print("Coil protrusion per edge (um): " +
           ", ".join(f"{e} {edge_depth[e]:.0f}" for e in ("left", "right", "top", "bottom")))
     print(f"Aluminium {METAL_THICKNESS_UM} um thick, W={WIRE_WIDTH} um -> "
           f"sheet res {SHEET_RES:.3f} ohm/sq; {WIRE_WIDTH/SHEET_RES:.1f} um per ohm.")
-    big = max((len(c["inputs"]) for c in coupons if not c.get("single")), default=0)
-    if big and (input_target_r(big) > 1e6 or max(DIE_W, DIE_H) > 5e4):
-        print(f"  ! BINARY ladder still needs a {input_target_r(big):,.0f} ohm "
-              f"resistor (a {big}-input coupon) and a {DIE_W/1000:.0f} x "
-              f"{DIE_H/1000:.0f} mm die -- lower MAX_BINARY_INPUTS.")
+    print(f"Shared node is a hollow ring, {PLANE_RING_WIDTH:.0f} um walls.")
+    if PLANE_RING_WIDTH < FINGER_OVERLAP:
+        print(f"  ! PLANE_RING_WIDTH {PLANE_RING_WIDTH:.0f} < FINGER_OVERLAP "
+              f"{FINGER_OVERLAP:.0f}: returns would overshoot the wall into the "
+              f"hollow and land on nothing. Raise it.")
+    # The ladder restarts in every reading, so the biggest resistor is set by the
+    # biggest READING, not by the coupon's total input count.
+    big = max((-(-len(c["inputs"]) // arcs_needed(len(c["inputs"])))
+               for c in coupons if not c.get("single")), default=0)
+    if big and input_target_r(big) > 1e6:
+        print(f"  ! BINARY ladder needs a {input_target_r(big):,.0f} ohm resistor for "
+              f"a {big}-resistor reading -- lower MAX_BINARY_INPUTS.")
+    if max(DIE_W, DIE_H) > 5e4:
+        print(f"  ! Die is {DIE_W/1000:.0f} x {DIE_H/1000:.0f} mm. Fewer inputs per "
+              f"group, or a smaller COIL_BASE_R, would shrink it.")
     matched = [g["num"] for g in groups]
     wired_in = sum(len(g["inputs"]) for g in groups)
     print(f"Matched group numbers {matched}: {len(groups)} groups, "
@@ -1669,14 +2060,10 @@ def main():
         print(f"  group {g['num']}: {len(g['inputs'])} inputs, "
               f"{len(g['outputs'])} outputs{extra}")
     if single_in:
-        ret = f"{len(single_out)} OUTPUTSINGLE" + (" + OUTPUTSPLIT half" if split_outs else "")
+        ret = (f"{len(single_out)} OUTPUTSINGLE" if single_out
+               else f"{len(common_pads) if common_pads else len(outputs)} shared output")
         print(f"  SINGLE continuity coupon: {len(single_in)} INPUTSINGLE shorted to its "
               f"return [{ret}] on one layer, per-pin continuity.")
-    if split_outs:
-        top_n = len(split_outs[0::2])
-        print(f"  {len(split_outs)} OUTPUTSPLIT pads on every chip, halved per chip: "
-              f"{top_n} on the top layer, {len(split_outs) - top_n} on the bottom.")
-
     xs = [p["x"] for p in pads]
     ys = [p["y"] for p in pads]
     bounds = (min(xs), max(xs), min(ys), max(ys))
@@ -1694,11 +2081,11 @@ def main():
     all_rows = []
     mosaic_entries = []
     for ci, chip_coupons in enumerate(chips, 1):
-        lib, geo, rows = build_chip(ci, chip_coupons, pads, bounds, split_outs)
+        lib, geo, rows = build_chip(ci, chip_coupons, pads, bounds)
         all_rows.extend(rows)
         tags = [tag(c) for c in chip_coupons]
         gds_out = safe_path(GDS_DIR / f"groups_{'_'.join(tags)}.gds")
-        lib.write_gds(gds_out)
+        lib.write_gds(gds_out, max_points=GDS_MAX_POINTS)
         safe_path(SCHEMATIC_DIR / f"schematic_{'_'.join(tags)}.svg").write_text(
             build_schematic_svg(ci, rows), encoding="utf-8")   # circuit diagram
         mosaic_entries.append((lib.cells[0], DIE_W, DIE_H))
@@ -1716,13 +2103,13 @@ def main():
         w.writerows(all_rows)
 
     # Calibration coupon: same pad ring as the test chips, so the probe card lands on
-    # it directly. split_outs is deliberately NOT passed -- an OUTPUTSPLIT tap joining
-    # the plane would short out the very resistors we are trying to measure.
+    # it directly. It is built from its own pad list alone -- any extra tap joining the
+    # plane would short out the very resistors we are trying to measure.
     if calib:
         calib_lib, _, calib_rows = build_chip(len(chips) + 1, [calib], pads, bounds)
         label_calib_values(calib_lib.cells[0], calib_rows, calib["inputs"], bounds)
         calib_gds = safe_path(CALIB_DIR / "calibration_resistors.gds")
-        calib_lib.write_gds(calib_gds)
+        calib_lib.write_gds(calib_gds, max_points=GDS_MAX_POINTS)
         with open(safe_path(CALIB_DIR / "calibration_resistors.csv"), "w",
                   newline="") as f:
             w = csv.writer(f)
@@ -1764,7 +2151,7 @@ def main():
     wafer_lib, n_fields = build_wafer(mosaic_lib, field_origins, WAFER_DIAM_UM,
                                       WAFER_LAYER, WAFER_DT)
     wafer_gds = safe_path(OUTPUT_DIR / "all_tiled_chips.gds")
-    wafer_lib.write_gds(wafer_gds)
+    wafer_lib.write_gds(wafer_gds, max_points=GDS_MAX_POINTS)
     print(f"Wrote {wafer_gds.name}: {len(mosaic_entries)} dies in a {cols}-col field "
           f"({fw/1000:.1f} x {fh/1000:.1f} mm) -> {n_fields} fields, "
           f"{n_fields * len(mosaic_entries)} dies on a {WAFER_DIAM_UM/1000:.0f} mm "

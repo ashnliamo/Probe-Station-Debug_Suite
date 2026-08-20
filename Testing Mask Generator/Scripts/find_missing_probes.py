@@ -6,7 +6,9 @@ HERE = pathlib.Path(__file__).parent
 DECODE_DIR = HERE.parent / "decode_inputs"
 
 CHIP, LAYER, PAD, R_COL = "chip", "layer", "input_pad", "actual_R_ohm"
-HALF = "half"      # split coupons: each half is its own decode unit; 0 when not split
+HALF = "half"      # split coupons: each READING is its own decode unit; 0 when not
+                   # split. Named 'half' for CSV compatibility, but a coupon may be cut
+                   # into more than two readings when it exceeds MAX_BINARY_INPUTS.
 MATCH_TOL = 0.05   # accept a subset if its predicted R is within this of measured
 
 
@@ -50,7 +52,8 @@ def load(path):
 
 
 def row_half(r):
-    """This row's half, or 0 for an unsplit coupon or an older CSV with no column."""
+    """This row's reading number, or 0 for an unsplit coupon or an older CSV with no
+    column. Any integer is accepted: a coupon may have more than two readings."""
     try:
         return int((r.get(HALF) or "0").strip() or "0")
     except ValueError:
@@ -90,46 +93,8 @@ def parse_ohms(s):
 
 
 # ----------------------------------------------------------------------
-# Calibration offsets (real resistance != theoretical)
+# Calibration: per-rung scale read from the generator's calibration CSV
 # ----------------------------------------------------------------------
-def canonical_rungs(rows, tol=0.05):
-    """Distinct resistance rungs in the CSV. The binary ladder doubles per rung, so
-    values within `tol` are one rung; returns each cluster's lowest value, ascending."""
-    rungs = []
-    for v in sorted(float(r[R_COL]) for r in rows):
-        if not rungs or v > rungs[-1] * (1 + tol):
-            rungs.append(v)
-    return rungs
-
-
-def ask_calibration(rungs):
-    """Optionally read each ladder rung off the calibration chip, returning
-    {rung: offset} with offset = measured - theoretical (reused for every chip/layer).
-    Blank leaves a rung uncorrected; declining at the first prompt skips all."""
-    if input("\nApply calibration offsets (measure the calibration chip)? [y/N]: "
-             ).strip().lower() not in ("y", "yes"):
-        return {}
-    print("For each theoretical resistance, enter the MEASURED value of the matching\n"
-          "calibration resistor (blank to leave that rung uncorrected):")
-    offsets = {}
-    for rung in rungs:
-        m = parse_ohms(input(f"   ~{rung:,.0f} ohm calibration resistor measures: "))
-        if m is None:
-            print("     couldn't read that -- left uncorrected.")
-        elif m != float("inf"):
-            offsets[rung] = m - rung
-            print(f"     offset {m - rung:+,.2f} ohm")
-    return offsets
-
-
-def apply_offsets(resistors, rungs, offsets):
-    """Add each resistor's nearest-rung offset so the values match real hardware.
-    Returns a new (pad, R) list sorted by corrected resistance."""
-    def corrected(R):
-        return R + offsets.get(min(rungs, key=lambda v: abs(v - R)), 0.0)
-    return sorted(((pad, corrected(R)) for pad, R in resistors), key=lambda t: t[1])
-
-
 CAL_TARGET, CAL_CALC, CAL_MEAS = "target_r_ohm", "actual_r_ohm", "measured_r_ohm"
 
 
@@ -272,18 +237,26 @@ def main():
     combos = sorted({(int(r[CHIP]), int(r[LAYER]), row_half(r)) for r in rows})
     print(f"Chips available: {sorted({c for c, _, _ in combos})}")
 
-    rungs = canonical_rungs(rows)
     cal_path = find_calibration_csv()
     cal = load_calibration(cal_path) if cal_path else None
-    offsets = {}
     if cal:
         print(f"Calibrating from {cal_path.name}: per-rung scale "
               + ", ".join(f"{n:,.0f} ohm x{s:.3f}" for n, s in cal))
     else:
-        if cal_path:
-            print(f"Found {cal_path.name} but no measured_R_ohm values yet -- "
-                  f"fill that column in to auto-calibrate.")
-        offsets = ask_calibration(rungs)
+        # A wrong sheet resistance scales every resistor by the same factor, and the
+        # decode compares against ABSOLUTE values, so it cannot absorb that itself. A
+        # reading tolerates only half its decode margin of uniform error before it
+        # names a probe that is actually landed.
+        why = (f"{cal_path.name} has no measured_R_ohm values yet"
+               if cal_path else
+               f"no calibration CSV in {DECODE_DIR.name}")
+        print(f"\n  ! NOT CALIBRATED -- {why}.")
+        print(f"  ! Results are only trustworthy if the fabricated film happens to "
+              f"match the\n"
+              f"    resistivity the generator assumed. Measure the calibration chip, "
+              f"fill in the\n"
+              f"    measured_R_ohm column, and copy that CSV into "
+              f"{DECODE_DIR.name}/.")
 
     while True:                             # one decode per chip/layer; blank quits
         raw = input("\nChip # (blank to quit): ").strip()
@@ -298,10 +271,10 @@ def main():
             print(f"  No chip {chip}. Available: {sorted({c for c, _, _ in combos})}")
             continue
         layer = ask_choice(f"Layer # {chip_layers}: ", chip_layers)
-        # A split coupon has two independent halves on this layer -- each is measured
-        # and decoded on its own, between its OWN output pads and the input rail.
+        # A split coupon has several independent readings on this layer -- each is
+        # measured and decoded on its own, between its OWN output pads and the rail.
         halves = sorted({h for c, l, h in combos if c == chip and l == layer})
-        half = ask_choice(f"Half # {halves}: ", halves) if halves != [0] else 0
+        half = ask_choice(f"Reading # {halves}: ", halves) if halves != [0] else 0
 
         sel = [r for r in rows if int(r[CHIP]) == chip and int(r[LAYER]) == layer
                and row_half(r) == half]
@@ -310,12 +283,9 @@ def main():
         if cal:
             resistors = apply_calibration(resistors, cal)
             note = f" (calibrated from {cal_path.name})"
-        elif offsets:
-            resistors = apply_offsets(resistors, rungs, offsets)
-            note = " (calibration-corrected)"
         else:
-            note = ""
-        where = f"Chip {chip}, layer {layer}" + (f", half {half}" if half else "")
+            note = " (UNCALIBRATED)"
+        where = f"Chip {chip}, layer {layer}" + (f", reading {half}" if half else "")
         print(f"\n{where}: {len(resistors)} input resistors{note}")
         print(f"   measure between the input rail and: {sel[0]['output_pads']}")
         for pad, R in resistors:
