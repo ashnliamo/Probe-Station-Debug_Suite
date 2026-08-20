@@ -2,55 +2,71 @@ import csv
 import math
 import pathlib
 
+# Every length is in micrometres EXCEPT the SCH_* block at the bottom, which is
+# in mils because Altium's schematic editor works in mils on a 100 mil grid.
+
+# Folders, resolved relative to this file so the project can be moved freely.
 HERE = pathlib.Path(__file__).parent
-INPUT_DIR = HERE.parent / "auto_probe_pcb_inputs"
-OUTPUT_DIR = HERE.parent / "auto_probe_pcb_outputs"
+INPUT_DIR = HERE.parent / "auto_probe_pcb_inputs"      # holds exactly one .csv
+OUTPUT_DIR = HERE.parent / "auto_probe_pcb_outputs"    # generated files go here
+
+# CSV column headers the reader looks for (matched case-insensitively).
 COL_PAD, COL_SIGNAL, COL_X, COL_Y = ("pad", "signal", "x (um)", "y (um)")
-COL_NETCLASS = "net class"
-UNCLASSIFIED = "UNCLASSIFIED"
+COL_NETCLASS = "net class"          # groups lands into schematic components
+UNCLASSIFIED = "UNCLASSIFIED"       # bucket for pads with a blank net class
 
-DIE_X = 8170.73
-DIE_Y = 5155.584
-PROBE_PAD_SIDE = 1000
-PROBE_PAD_CLEARANCE = 200
-PROBE_PAD_PITCH = PROBE_PAD_SIDE + PROBE_PAD_CLEARANCE
-PROBE_WIRE_WIDTH = 150
+# --- die ------------------------------------------------------------------
+DIE_X = 8170.73                     # die width; hardcoded, NOT read from the CSV
+DIE_Y = 5155.584                    # die height; hardcoded, NOT read from the CSV
 
-LAND_ROWS = 2
-NEEDLE_CLEARANCE = 127
-ROW_GAP = PROBE_PAD_SIDE + PROBE_PAD_CLEARANCE
-ROW_PITCH = max(PROBE_PAD_PITCH,
+# --- probe lands ----------------------------------------------------------
+PROBE_PAD_SIDE = 1000               # land outer DIAMETER (pads are round)
+PROBE_PAD_CLEARANCE = 200           # bare copper gap between adjacent lands
+PROBE_PAD_PITCH = PROBE_PAD_SIDE + PROBE_PAD_CLEARANCE   # derived: land spacing
+PROBE_WIRE_WIDTH = 150              # drawn width of the reference needle tracks
+
+# --- two staggered rows of lands per edge ---------------------------------
+LAND_ROWS = 2                       # lands per edge stack in this many rows
+NEEDLE_CLEARANCE = 127              # needle-to-land margin (0.005 in)
+ROW_GAP = PROBE_PAD_PITCH           # derived: radial spacing between the rows
+ROW_PITCH = max(PROBE_PAD_PITCH,    # derived: spacing within one row; the wider
                 PROBE_PAD_SIDE + PROBE_WIRE_WIDTH + 2 * NEEDLE_CLEARANCE)
-STAGGER_STEP = ROW_PITCH / float(LAND_ROWS)
+STAGGER_STEP = ROW_PITCH / float(LAND_ROWS)   # derived: step along the edge
 
-BOARD_CENTER = (4000 * 25.4, 3000 * 25.4)
-VIA_DRILL = 508 # 0.02" via hole
-BOARD_WIDTH = 114500
-BOARD_HEIGHT = 188500
-APERTURE_CLEARANCE = 3175
-KEEP_OUT_WIDTH = 44450
-KEEP_OUT_HEIGHT = 38100
-LAND_KEEPOUT_GAP = 1500
+# --- board ----------------------------------------------------------------
+BOARD_CENTER = (4000 * 25.4, 3000 * 25.4)     # card center on the Altium sheet
+VIA_DRILL = 508                     # plated hole, 0.020 in: Accuprobe's floor
+BOARD_WIDTH = 114500                # card width  (114.5 mm)
+BOARD_HEIGHT = 188500               # card height (188.5 mm)
+APERTURE_CLEARANCE = 3175           # die corner to the edge of the round cutout
 
-LABEL_SIZE = 400
-LABEL_THICK = 60
-LABEL_GAP = 508
-MARKER_LINE = 150
+# --- keep-out (also sets the land ring's aspect ratio) --------------------
+KEEP_OUT_WIDTH = 44450              # ring-assembly keep-out rectangle, width
+KEEP_OUT_HEIGHT = 38100             # ring-assembly keep-out rectangle, height
+LAND_KEEPOUT_GAP = 1500             # smallest allowed land-to-keep-out gap
 
-ALTIUM_MARKER_LAYER  = "eMechanical15"
-ALTIUM_REF_LAYER     = "eMechanical13"
+# --- silkscreen and reference markers -------------------------------------
+LABEL_SIZE = 400                    # silk text height
+LABEL_THICK = 60                    # silk stroke width
+LABEL_GAP = 508                     # land edge to the start of its label
+MARKER_LINE = 150                   # keep-out marker line width
 
-# shared by the PcbLib footprint and the SchLib component -- the two must match
-# for Altium to resolve the symbol's footprint model.
+# Non-fabricated drawing layers used for reference geometry.
+ALTIUM_MARKER_LAYER  = "eMechanical15"   # keep-out rectangle
+ALTIUM_REF_LAYER     = "eMechanical13"   # probe needles
+
+# Shared by the PcbLib footprint and the SchLib component; the two names must
+# match or Altium cannot resolve the symbol's footprint model.
 PROBECARD_NAME = "ProbeCard"
 
-# --- SchLib symbol (one net-class part per block), all in mils ---
-SCH_PIN_PITCH = 100
-SCH_PIN_LENGTH = 300
-SCH_BLOCK_WIDTH = 1200
+# --- schematic symbol: MILS, not micrometres ------------------------------
+SCH_PIN_PITCH = 100                 # pin spacing; 100 mil is Altium's grid
+SCH_PIN_LENGTH = 300                # pin stub length; wires connect at its tip
+SCH_BLOCK_WIDTH = 1200              # component body width
 
 
-def read_pads(csv_path): # parsing the inputted CSV
+def read_pads(csv_path):
+    """Parse the pinout CSV into one dict per pad."""
     with open(csv_path, newline="") as f:
         rows = list(csv.reader(f))
     header_idx = None
@@ -81,13 +97,15 @@ def read_pads(csv_path): # parsing the inputted CSV
     return pads
 
 
-def die_center(pads): # finds the center of the die based on the pads
+def die_center(pads):
+    """center of the pad bounding box, used as the die center."""
     xs = [p["x"] for p in pads]
     ys = [p["y"] for p in pads]
     return (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
 
 
-def group_by_edge(pads, cx, cy): # classifies each pad into top, bottom, left, or right and groups them
+def group_by_edge(pads, cx, cy):
+    """Sort pads into T/B/L/R buckets by the die edge each sits nearest."""
     edges = {"T": [], "B": [], "L": [], "R": []}
     for p in pads:
         nx = (p["x"] - cx) / (DIE_X / 2.0)
@@ -100,7 +118,8 @@ def group_by_edge(pads, cx, cy): # classifies each pad into top, bottom, left, o
     return edges
 
 
-def smooth_die_pad_spacing(targets, pitch): # spaces landing pads evenly along the edge of the die, while keeping them as close as possible to their original positions
+def smooth_die_pad_spacing(targets, pitch):
+    """Spread lands along an edge while holding the minimum pitch."""
     n = len(targets)
     if n == 0:
         return []
@@ -119,6 +138,7 @@ def smooth_die_pad_spacing(targets, pitch): # spaces landing pads evenly along t
 
 
 def required_scale(edges): 
+    """Smallest keep-out multiple that fits every edge's row of lands."""
     s = 1.0 + 2.0 * LAND_KEEPOUT_GAP / min(KEEP_OUT_WIDTH, KEEP_OUT_HEIGHT)
     for edge, pads in edges.items():
         if not pads:
@@ -130,6 +150,7 @@ def required_scale(edges):
 
 
 def place_probes(edges, cx, cy, scale):
+    """Place each land on the keep-out ring, alternating rows."""
     half_ax = scale * KEEP_OUT_WIDTH / 2.0
     half_ay = scale * KEEP_OUT_HEIGHT / 2.0
     probes = []
@@ -158,6 +179,7 @@ def place_probes(edges, cx, cy, scale):
 
 
 def compute_layout(pads):
+    """center the die on the board, group pads by edge, place the lands."""
     cx0, cy0 = die_center(pads)
     dx, dy = BOARD_CENTER[0] - cx0, BOARD_CENTER[1] - cy0
     for p in pads:
@@ -171,14 +193,17 @@ def compute_layout(pads):
 
 
 def aperture_radius():
+    """Radius of the round board cutout, clearing the die's corners."""
     return math.hypot(DIE_X / 2.0, DIE_Y / 2.0) + APERTURE_CLEARANCE
 
 
 def marker_dims():
+    """Keep-out rectangle size."""
     return KEEP_OUT_WIDTH, KEEP_OUT_HEIGHT
 
 
 def check_fit(L):
+    """Tightest clearance between any land's copper and the card outline."""
     cx, cy = L["cx"], L["cy"]
     half_w = BOARD_WIDTH / 2.0
     half_h = BOARD_HEIGHT / 2.0
@@ -186,14 +211,10 @@ def check_fit(L):
     worst = min(min(half_w - abs(pr["x"] - cx), half_h - abs(pr["y"] - cy))
                 for pr in L["probes"]) - pad_half
     frame_lr = half_w - (L["scale"] * KEEP_OUT_WIDTH / 2.0)
-    if worst < 0:
-        print(f"  WARNING: lands extend {-worst:.0f} um past the card outline.")
-    else:
-        print(f"  Min land-to-card-edge clearance: {worst:.0f} um.")
-    print(f"  Left/right copper frame width ~ {frame_lr - PROBE_PAD_SIDE/2:.0f} um.")
 
 
 def _altium_label(pr):
+    """Position and rotation of one land's silkscreen label."""
     off = ((LAND_ROWS - 1 - pr["row"]) * ROW_GAP
            + PROBE_PAD_SIDE / 2.0 + LABEL_GAP) / 1000.0
     h = LABEL_SIZE / 1000.0
@@ -210,13 +231,42 @@ def _altium_label(pr):
     return (x - off - ln, y - h / 2, 0.0, sig)
 
 
+def mm(v):
+    """Format a millimetre value for DelphiScript."""
+    return f"{v:.4f}"
+
+
 def _pas_str(s):
+    """Quote and escape a string literal for DelphiScript."""
     return "'" + s.replace("'", "''") + "'"
 
 
+def _pad_proc_pas(proc_name, add_call):
+    """Pad-creation procedure shared by the board and footprint scripts."""
+    pad = mm(PROBE_PAD_SIDE / 1000.0)
+    hole = mm(VIA_DRILL / 1000.0)
+    return f"""Procedure {proc_name}(XMM, YMM : Double; Desig : String);
+Var Pad;
+Begin
+    Pad := PCBServer.PCBObjectFactory(ePadObject, eNoDimension, eCreate_Default);
+    Pad.X := MMsToCoord(XMM);
+    Pad.Y := MMsToCoord(YMM);
+    Pad.Layer := eMultiLayer;
+    Pad.TopShape := eRounded;
+    Pad.MidShape := eRounded;
+    Pad.BotShape := eRounded;
+    Pad.TopXSize := MMsToCoord({pad}); Pad.TopYSize := MMsToCoord({pad});
+    Pad.MidXSize := MMsToCoord({pad}); Pad.MidYSize := MMsToCoord({pad});
+    Pad.BotXSize := MMsToCoord({pad}); Pad.BotYSize := MMsToCoord({pad});
+    Pad.HoleSize := MMsToCoord({hole});
+    Pad.Plated := True;
+    Pad.Name := Desig;
+    {add_call};
+End;"""
+
+
 def _part_name(netclass):
-    # one component/footprint per net class -- the SchLib component and its
-    # PcbLib footprint share this name so Altium resolves the footprint model.
+    """Component and footprint name for a net class, e.g. ProbeCard_Power."""
     safe = "".join(c if c.isalnum() else "_" for c in netclass)
     while "__" in safe:
         safe = safe.replace("__", "_")
@@ -225,19 +275,15 @@ def _part_name(netclass):
 
 
 def write_altium_script(path, L):
+    """Write the PcbDoc script: board, aperture, lands, labels, needles."""
     cx, cy = L["cx"], L["cy"]
     HW = BOARD_WIDTH / 2.0
     HH = BOARD_HEIGHT / 2.0
     APR = aperture_radius()
     MW, MH = marker_dims()
-    PAD = PROBE_PAD_SIDE / 1000.0
-    HOLE = VIA_DRILL / 1000.0
     TEXTH = LABEL_SIZE / 1000.0
     TEXTW = LABEL_THICK / 1000.0
     PROBEW = PROBE_WIRE_WIDTH / 1000.0
-
-    def mm(v):
-        return f"{v:.4f}"
 
     o = []
     w = o.append
@@ -253,24 +299,7 @@ Begin
         PCBM_BoardRegisteration, Obj.I_ObjectAddress);
 End;
 
-Procedure AddLand(XMM, YMM : Double; Desig : String);
-Var Pad;
-Begin
-    Pad := PCBServer.PCBObjectFactory(ePadObject, eNoDimension, eCreate_Default);
-    Pad.X := MMsToCoord(XMM);
-    Pad.Y := MMsToCoord(YMM);
-    Pad.Layer := eMultiLayer;
-    Pad.TopShape := eRounded;
-    Pad.MidShape := eRounded;
-    Pad.BotShape := eRounded;
-    Pad.TopXSize := MMsToCoord({mm(PAD)}); Pad.TopYSize := MMsToCoord({mm(PAD)});
-    Pad.MidXSize := MMsToCoord({mm(PAD)}); Pad.MidYSize := MMsToCoord({mm(PAD)});
-    Pad.BotXSize := MMsToCoord({mm(PAD)}); Pad.BotYSize := MMsToCoord({mm(PAD)});
-    Pad.HoleSize := MMsToCoord({mm(HOLE)});
-    Pad.Plated := True;
-    Pad.Name := Desig;
-    RegisterObj(Pad);
-End;
+{_pad_proc_pas("AddLand", "RegisterObj(Pad)")}
 
 Procedure AddText(XMM, YMM, Rot : Double; S : String);
 Var T;
@@ -419,6 +448,7 @@ End;
 
 
 def write_wiring_map(path, L):
+    """Write the CSV mapping every land to its die pad and coordinates."""
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["land_id", "edge", "row", "signal", "die_pad",
@@ -431,25 +461,23 @@ def write_wiring_map(path, L):
 
 
 def _edge_order(pr):
+    """Sort key ordering lands T, B, L, R then by land number."""
     return ("TBLR".index(pr["edge"]), int(pr["id"][1:]))
 
 
 def group_by_netclass(probes):
+    """Bucket lands by net class and merge differential pairs."""
     classes = {}
     for pr in probes:
         classes.setdefault(pr["die"]["netclass"], []).append(pr)
-    # within a block, keep shared nets contiguous, then order by land id
     for members in classes.values():
         members.sort(key=lambda pr: (pr["die"]["signal"], _edge_order(pr)))
     classes = merge_diff_pairs(classes)
-    # emit the blocks in descending size so the widest sheet reads left-heavy
     return dict(sorted(classes.items(), key=lambda kv: (-len(kv[1]), kv[0])))
 
 
 def _interleave_pairs(p_members, n_members):
-    # place each P land next to its N partner (the signal differing in exactly
-    # one position -- the polarity letter, e.g. CLKEXTP<0> / CLKEXTM<0>), so the
-    # merged column reads P, N, P, N... Unmatched lands trail at the end.
+    """Order a merged block so each P land sits above its N partner."""
     pool = list(n_members)
     ordered = []
     for p in p_members:
@@ -470,9 +498,7 @@ def _interleave_pairs(p_members, n_members):
 
 
 def merge_diff_pairs(classes):
-    # merge net-class pairs that differ only by a trailing " P"/" N" (a
-    # differential pair split across two classes) into one block named by the
-    # shared prefix, with each P land interleaved next to its N partner.
+    """Combine net classes differing only by a trailing P or N."""
     out = {}
     used = set()
     for name in classes:
@@ -493,20 +519,9 @@ def merge_diff_pairs(classes):
 
 
 def write_pcb_library_script(path, L):
-    # Emit ONE PcbLib footprint PER NET CLASS -- each holds only that class's
-    # lands, as pads at their real board positions (relative to the die centre),
-    # pad designators = land ids. Altium allows one footprint per component, so
-    # these pair 1:1 with the per-net-class SchLib components of the same name.
-    # Because every footprint keeps absolute board coordinates, placing all of
-    # them at the same origin reconstructs the full land pattern.
-    # UNVERIFIED against a live Altium.
+    """Write the PcbLib script: one footprint per net class."""
     classes = group_by_netclass(L["probes"])
     cx, cy = L["cx"], L["cy"]
-    PAD = PROBE_PAD_SIDE / 1000.0
-    HOLE = VIA_DRILL / 1000.0
-
-    def mm(v):
-        return f"{v:.4f}"
 
     o = []
     w = o.append
@@ -515,31 +530,14 @@ def write_pcb_library_script(path, L):
 // .PcbLib the ACTIVE document, then File > Run Script... and run
 // GenerateFootprint. Builds one footprint per net class; each holds that
 // class's probe-card lands (pad designators = land ids) at their real board
-// positions relative to the die centre. Place them all at the same origin to
+// positions relative to the die center. Place them all at the same origin to
 // reconstruct the complete land pattern.
 
 Var
     Lib : IPCB_Library;
     FP  : IPCB_LibComponent;
 
-Procedure AddFPPad(XMM, YMM : Double; Desig : String);
-Var Pad;
-Begin
-    Pad := PCBServer.PCBObjectFactory(ePadObject, eNoDimension, eCreate_Default);
-    Pad.X := MMsToCoord(XMM);
-    Pad.Y := MMsToCoord(YMM);
-    Pad.Layer := eMultiLayer;
-    Pad.TopShape := eRounded;
-    Pad.MidShape := eRounded;
-    Pad.BotShape := eRounded;
-    Pad.TopXSize := MMsToCoord({mm(PAD)}); Pad.TopYSize := MMsToCoord({mm(PAD)});
-    Pad.MidXSize := MMsToCoord({mm(PAD)}); Pad.MidYSize := MMsToCoord({mm(PAD)});
-    Pad.BotXSize := MMsToCoord({mm(PAD)}); Pad.BotYSize := MMsToCoord({mm(PAD)});
-    Pad.HoleSize := MMsToCoord({mm(HOLE)});
-    Pad.Plated := True;
-    Pad.Name := Desig;
-    FP.AddPCBObject(Pad);
-End;
+{_pad_proc_pas("AddFPPad", "FP.AddPCBObject(Pad)")}
 
 // --- start a named footprint. Drops any footprint of the same name from a
 // --- previous run first, so re-running replaces instead of colliding.
@@ -610,15 +608,7 @@ End;""")
 
 
 def write_sch_library_script(path, L):
-    # Emit ONE single-part SchLib component PER NET CLASS. Each is a rectangle
-    # with one pin per land (designator = land id, name = signal) and its own
-    # footprint-model reference to the PcbLib footprint of the same name --
-    # Altium allows one footprint per component, which is why these are five
-    # separate components rather than one five-part component. Pins map to pads
-    # by matching name, so no explicit pin map is needed. Each component gets
-    # its own library page, so all are drawn at the origin.
-    # UNVERIFIED against a live Altium -- footprint models are the most
-    # version-sensitive part of the Sch API.
+    """Write the SchLib script: one component per net class."""
     classes = group_by_netclass(L["probes"])
 
     o = []
@@ -708,10 +698,6 @@ End;
             w(f"    AddPin(0, {py}, {_pas_str(pr['id'])}, {_pas_str(sig)});")
         w(f"    EndComp({_pas_str(nm)});\nEnd;")
 
-    # NOTE: Lib.AddSchComponent always ADDs -- it never replaces a same-named
-    # component. Re-running into a library that already holds these components
-    # piles copies under the same names (overlapping rectangles). Delete the
-    # existing ProbeCard_* components in the SCH Library panel before re-running.
     w("""
 Procedure GenerateSymbol;
 Begin
@@ -739,6 +725,7 @@ End;""")
 
 
 def find_input_csv():
+    """Return the single CSV in the inputs folder, or stop with an error."""
     csvs = sorted(INPUT_DIR.glob("*.csv"))
     if not csvs:
         raise SystemExit(f"No .csv found in {INPUT_DIR} -- put your pinout there.")
@@ -749,13 +736,14 @@ def find_input_csv():
 
 
 def main():
+    """Read the pinout, compute the layout, write the four output files."""
     csv_path = find_input_csv()
     pads = read_pads(csv_path)
     L = compute_layout(pads)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     counts = {e: len(v) for e, v in L["edges"].items()}
-    print(f"Die {DIE_X} x {DIE_Y} um, centre ({L['cx']:.1f}, {L['cy']:.1f})")
+    print(f"Die {DIE_X} x {DIE_Y} um, center ({L['cx']:.1f}, {L['cy']:.1f})")
     print(f"Per-edge pad counts: {counts}")
     print(f"Land ring = keep-out x{L['scale']:.2f} -> "
           f"{L['scale']*KEEP_OUT_WIDTH/1000:.1f} x "

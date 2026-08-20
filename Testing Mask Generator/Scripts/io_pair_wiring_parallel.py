@@ -1200,10 +1200,11 @@ def plan_split(group, bounds):
     whose edge hosts inputs fragments that edge's routing, so it is taken only when
     input placement forces it.
 
-    The choice is remembered on the group by the identity of the pad before each cut,
-    because the sizing pass and the drawing pass see different absolute coordinates --
-    the ring is rescaled between them -- and both must divide the coupon identically or
-    the resistor ladders diverge."""
+    The sizing and drawing passes both call this, at different absolute coordinates,
+    and must divide the coupon identically or the resistor ladders diverge. They do:
+    place_pads only TRANSLATES the pad ring, never rescales it, and every quantity here
+    is a difference of coordinates, so the answer is translation-invariant. build_chip
+    checks the drawn result against the die the sizing pass chose."""
     # A continuity coupon is already one shorted node; halving it would leave each
     # input reachable from only half the returns, which its CSV does not express. The
     # calibration coupon is a star onto ONE common pad, and splitting it would restart
@@ -1288,25 +1289,15 @@ def plan_split(group, bounds):
     if base < 1:
         raise SystemExit(f"coupon {group['num']}: {n} inputs cannot fill {k} readings.")
 
-    cached = group.get("_split_cache")
-    if cached:
-        for roomy in (True, False):
-            cands = make_cands(roomy)
-            by_id = {id(lands[i][2]): i for i in range(m)}
-            gis = [by_id.get(pid) for pid in cached]
-            if all(g is not None and g in cands for g in gis):
-                return (env, bounds, sorted(cands[g][0] for g in gis))
-        raise SystemExit(f"internal: coupon {group['num']}'s split no longer fits "
-                         f"after rescaling; this is a bug, please report it.")
-
     best = None
     reason = "no gap between pad landings is wide enough for a cut"
     # Two passes: first demanding enough room beside every cut for the channel router's
     # riser bank, then, only if that admits no split at all, with the bare minimum.
+    best_roomy = None
     for roomy in (True, False):
-      cands = make_cands(roomy)
       if best is not None:
         break
+      cands = make_cands(roomy)
       for rot in range(n):
           for mask in (itertools.combinations(range(k), extra) if extra else [()]):
               sizes = [base + (1 if j in mask else 0) for j in range(k)]
@@ -1354,14 +1345,16 @@ def plan_split(group, bounds):
                            min(cands[g][1] for g in chosen))
                   if best is None or score > best[0]:
                       best = (score, chosen)
+                      best_roomy = roomy
     if best is None:
         raise SystemExit(
             f"coupon {group['num']} cannot be cut into {k} independent readings: "
             f"{reason}. Spread its OUTPUT pads further around the ring, add more of "
             f"them, or raise MAX_BINARY_INPUTS.")
-    chosen = best[1]
-    group["_split_cache"] = tuple(id(lands[g][2]) for g in chosen)
-    return (env, bounds, sorted(cands[g][0] for g in chosen))
+    # The clearance level decides where IN a gap the cut sits, so read the positions
+    # back out of the level that actually validated this choice.
+    cands = make_cands(best_roomy)
+    return (env, bounds, sorted(cands[g][0] for g in best[1]))
 
 
 def split_arcs(split):
@@ -1879,9 +1872,8 @@ def ask_layers(default=2):
 
 def size_and_place(pads, groups, min_die=(0.0, 0.0)):
     """Build each coil at its raw position to measure per-edge protrusion, set the
-    global die size (>= farthest comb + DIE_MARGIN_BUFFER, ring aspect kept, and
-    >= `min_die` in each dimension so the chips match the calibration coupon), and
-    centre the ring. Returns the per-edge protrusion."""
+    global die size -- each dimension the farthest comb on that axis plus
+    DIE_MARGIN_BUFFER, and at least `min_die` -- and centre the ring. Returns the per-edge protrusion."""
     rxs = [p["x"] for p in pads]
     rys = [p["y"] for p in pads]
     raw_bounds = (min(rxs), max(rxs), min(rys), max(rys))
@@ -1911,10 +1903,12 @@ def size_and_place(pads, groups, min_die=(0.0, 0.0)):
     buf = DIE_MARGIN_BUFFER
     content_w = ring_w + edge_depth["left"] + edge_depth["right"] + 2 * buf
     content_h = ring_h + edge_depth["top"] + edge_depth["bottom"] + 2 * buf
-    scale = max(content_w / ring_w, content_h / ring_h)
     global DIE_W, DIE_H
-    DIE_W, DIE_H = scale * ring_w, scale * ring_h        # scale keeps the ring aspect
-    DIE_W, DIE_H = max(DIE_W, min_die[0]), max(DIE_H, min_die[1])  # match calibration
+    # Each dimension is sized to its OWN content. The die used to be forced to keep the
+    # pad ring's aspect ratio, which meant scaling BOTH dimensions by whichever needed
+    # the most growth -- on a wide ring with deep top and bottom combs that left
+    # millimetres of empty silicon down each side.
+    DIE_W, DIE_H = max(content_w, min_die[0]), max(content_h, min_die[1])
     margins = {                                 # centre the content in the die
         "left": edge_depth["left"] + buf + (DIE_W - content_w) / 2,
         "right": edge_depth["right"] + buf + (DIE_W - content_w) / 2,
@@ -1955,12 +1949,24 @@ def build_chip(ci, chip_groups, pads, bounds):
             else:
                 cell.add(*gdstk.text(p["name"], LABEL_SIZE, (lx, ty),
                                      layer=LABEL_LAYER, datatype=LABEL_DT))
-    rows = []
+    rows, polys_all = [], []
     for li, group in enumerate(chip_groups):
         wpolys, grows = draw_group(group, li, bounds, cell, ci, pads,
                                    single=group.get("single", False))
         geo.setdefault(("group", group["num"]), []).extend(wpolys)
+        polys_all.extend(wpolys)
         rows.extend(grows)
+    # The die was sized from protrusions measured in the sizing pass; this is where we
+    # find out whether the drawing pass agreed. It should, because plan_split is
+    # translation-invariant and the ring is only shifted between the two -- but a
+    # silent disagreement would either waste die area or push metal off the edge.
+    mx = [v[0] for poly in polys_all for v in poly.points]
+    my = [v[1] for poly in polys_all for v in poly.points]
+    if mx:
+        over = max(-min(mx), max(mx) - DIE_W, max(my), -DIE_H - min(my))
+        if over > -1e-6:
+            print(f"  ! chip {ci}: drawn metal reaches {over:,.0f} um PAST the die edge; "
+                  f"the sizing pass under-measured this coupon.")
     if ADD_DIE_OUTLINE:                          # bottom layer, built LAST
         cell.add(gdstk.rectangle((0.0, 0.0), (DIE_W, -DIE_H),
                                  layer=BOUNDARY_LAYER, datatype=BOUNDARY_DT))
